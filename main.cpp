@@ -155,7 +155,14 @@ std::vector<double> ras_dist(const std::vector<Record>& group,
     return result;
 }
 
-// function to load country centroids from a csv file
+/*
+ * loadCentroidsCSV function:
+ *
+ * this function loads country/province centroids from a CSV file.
+ * it first reads the header and verifies that the required columns "centroid.lon"
+ * and "centroid.lat" are present. if not, it prints an error.
+ * if they are present, it uses their indices to extract the values from each row.
+ */
 std::vector<std::pair<double,double>> loadCentroidsCSV(const std::string& filename) {
     std::vector<std::pair<double,double>> centroids;
     std::ifstream file(filename);
@@ -163,33 +170,50 @@ std::vector<std::pair<double,double>> loadCentroidsCSV(const std::string& filena
         std::cerr << "error: cannot open centroids csv file " << filename << std::endl;
         return centroids;
     }
-
-    std::string line;
-    if (!std::getline(file, line)) {
+    std::string headerLine;
+    if (!std::getline(file, headerLine)) {
         std::cerr << "error: empty centroids file or missing header." << std::endl;
         return centroids;
     }
-
+    std::vector<std::string> headerTokens;
+    std::stringstream headerStream(headerLine);
+    std::string col;
+    while (std::getline(headerStream, col, ',')) {
+        headerTokens.push_back(col);
+    }
+    int lonIndex = -1;
+    int latIndex = -1;
+    for (size_t i = 0; i < headerTokens.size(); i++) {
+        std::string token = headerTokens[i];
+        std::transform(token.begin(), token.end(), token.begin(), ::tolower);
+        if (token == "centroid.lon") {
+            lonIndex = i;
+        } else if (token == "centroid.lat") {
+            latIndex = i;
+        }
+    }
+    if (lonIndex == -1 || latIndex == -1) {
+        std::cerr << "error: header does not contain required columns 'centroid.lon' and 'centroid.lat'" << std::endl;
+        return centroids;
+    }
+    std::string line;
     while (std::getline(file, line)) {
         std::stringstream ss(line);
+        std::vector<std::string> tokens;
         std::string token;
+        while (std::getline(ss, token, ',')) {
+            tokens.push_back(token);
+        }
+        if (tokens.size() <= static_cast<size_t>(std::max(lonIndex, latIndex)))
+            continue;
         double lonVal = std::numeric_limits<double>::quiet_NaN();
         double latVal = std::numeric_limits<double>::quiet_NaN();
-
-        // assuming the csv columns are:
-        // type,iso3,area_sqkm,centroid.lon,centroid.lat,...
-        if (!std::getline(ss, token, ',')) continue; // type
-        if (!std::getline(ss, token, ',')) continue; // iso3
-        if (!std::getline(ss, token, ',')) continue; // area_sqkm
-        if (!std::getline(ss, token, ',')) continue; // centroid.lon
         try {
-            lonVal = std::stod(token);
+            lonVal = std::stod(tokens[lonIndex]);
         } catch(...) {}
-        if (!std::getline(ss, token, ',')) continue; // centroid.lat
         try {
-            latVal = std::stod(token);
+            latVal = std::stod(tokens[latIndex]);
         } catch(...) {}
-
         if (!std::isnan(lonVal) && !std::isnan(latVal)) {
             centroids.push_back(std::make_pair(lonVal, latVal));
         }
@@ -225,7 +249,6 @@ std::vector<Record> cc_outl(const std::vector<Record>& records,
         speciesMap[rec.species].push_back(rec);
     }
     std::vector<bool> keep(records.size(), true);
-
     for (const auto& kv : speciesMap) {
         const auto &group = kv.second;
         if (group.size() < static_cast<size_t>(min_occs)) {
@@ -234,7 +257,6 @@ std::vector<Record> cc_outl(const std::vector<Record>& records,
         }
         size_t n = group.size();
         std::vector<double> values(n, 0.0);
-
         bool raster_flag = (group.size() >= 10000) || thinning;
         if (raster_flag) {
             bool useWeights = (!thinning);
@@ -271,7 +293,6 @@ std::vector<Record> cc_outl(const std::vector<Record>& records,
                 values = meanDistances;
             }
         }
-
         if (method == "distance") {
             for (size_t i = 0; i < n; i++) {
                 if (values[i] > tdi) {
