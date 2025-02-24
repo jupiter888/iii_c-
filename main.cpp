@@ -1,5 +1,3 @@
-// main.cpp
-
 #include <arrow/api.h>
 #include <arrow/io/api.h>
 #include <parquet/arrow/reader.h>
@@ -49,29 +47,20 @@ double haversine(double lon1, double lat1, double lon2, double lat2) {
 /*
  * raster approximation function:
  *
- * this function implements the "raster approximation" used in cc_outl.
  * for a given species group (vector of record) and a thinning resolution (in degrees),
- * it builds a grid covering the group’s extent. each record is assigned to a grid cell.
- * for each unique cell, we compute the centroid (the center of the cell) and count
- * how many records fall into it.
- *
- * then we compute the distance matrix among these unique cells (using the haversine function).
- *
- * depending on the flag "compute_min":
- *   - if compute_min is true (used when method=="distance"): for each cell,
- *     we compute the minimum distance from that cell to any other cell.
- *   - otherwise, we compute the mean distance from that cell to all other cells.
- *     if weights is true (i.e. not thinning), the mean distance is computed as a weighted
- *     mean where each cell’s contribution is multiplied by the count of records in that cell.
- *     if weights is false (thinning), a simple arithmetic mean is used.
- *
- * finally, each record in the group is assigned the computed value for its cell.
+ * this function builds a grid covering the group's extent.
+ * each record is assigned to a grid cell.
+ * for each unique cell, it computes the centroid (center of the cell) and counts
+ * the number of records in that cell.
+ * then it computes the distance matrix among these unique cells using the haversine formula.
+ * if compute_min is true, the minimum distance from the cell to any other cell is computed;
+ * otherwise, the mean distance is computed (weighted by cell count if weights is true).
+ * each record is then assigned the computed value for its cell.
  */
 std::vector<double> ras_dist(const std::vector<Record>& group,
                              double thinning_res,
                              bool weights,
                              bool compute_min) {
-    // determine extent (bounding box) for the group.
     double min_lon = std::numeric_limits<double>::max();
     double max_lon = std::numeric_limits<double>::lowest();
     double min_lat = std::numeric_limits<double>::max();
@@ -83,23 +72,18 @@ std::vector<double> ras_dist(const std::vector<Record>& group,
         if (rec.lat > max_lat) max_lat = rec.lat;
     }
 
-    // create grid dimensions. (thinning_res is in degrees.)
     int ncols = static_cast<int>(std::ceil((max_lon - min_lon) / thinning_res));
     int nrows = static_cast<int>(std::ceil((max_lat - min_lat) / thinning_res));
 
-    // map to hold unique cells keyed by a cell id computed from grid coordinates.
     std::unordered_map<int, RasterCell> cellMap;
-    // also keep a vector to map each record (in order) to its cell id.
     std::vector<int> recordCellId(group.size(), -1);
 
-    // for each record, determine the grid cell.
     for (size_t i = 0; i < group.size(); i++) {
         int cell_x = static_cast<int>(std::floor((group[i].lon - min_lon) / thinning_res));
         int cell_y = static_cast<int>(std::floor((group[i].lat - min_lat) / thinning_res));
         int cell_id = cell_y * ncols + cell_x;
         recordCellId[i] = cell_id;
         if (cellMap.find(cell_id) == cellMap.end()) {
-            // compute cell centroid.
             double centroid_lon = min_lon + (cell_x + 0.5) * thinning_res;
             double centroid_lat = min_lat + (cell_y + 0.5) * thinning_res;
             cellMap[cell_id] = RasterCell{cell_id, centroid_lon, centroid_lat, 1};
@@ -108,26 +92,20 @@ std::vector<double> ras_dist(const std::vector<Record>& group,
         }
     }
 
-    // build a vector of unique cells.
     std::vector<RasterCell> cells;
-    std::unordered_map<int, int> cellIdToIndex; // map cell id to index in cells vector
+    std::unordered_map<int, int> cellIdToIndex;
     for (const auto& kv : cellMap) {
         cellIdToIndex[kv.first] = static_cast<int>(cells.size());
         cells.push_back(kv.second);
     }
 
     int U = cells.size();
-    // if there is only one unique cell, we cannot compute distances.
-    // in that case, assign 0 to all records.
     std::vector<double> cellValues(U, 0.0);
     if (U < 2) {
-        // all records in the same cell get value 0.
         std::vector<double> result(group.size(), 0.0);
         return result;
     }
 
-    // create distance matrix among unique cells.
-    // we'll store it in a 2d vector: dist[i][j] is the distance from cell i to cell j.
     std::vector<std::vector<double>> dist(U, std::vector<double>(U, 0.0));
     for (int i = 0; i < U; i++) {
         for (int j = 0; j < U; j++) {
@@ -140,11 +118,8 @@ std::vector<double> ras_dist(const std::vector<Record>& group,
         }
     }
 
-    // for each unique cell, compute either the minimum distance to any other cell
-    // or the mean distance.
     for (int i = 0; i < U; i++) {
         if (compute_min) {
-            // compute minimum distance to any other cell.
             double minD = std::numeric_limits<double>::max();
             for (int j = 0; j < U; j++) {
                 if (i == j) continue;
@@ -153,14 +128,12 @@ std::vector<double> ras_dist(const std::vector<Record>& group,
             }
             cellValues[i] = minD;
         } else {
-            // compute mean distance.
             double sum = 0.0;
             double totalWeight = 0.0;
             int count = 0;
             for (int j = 0; j < U; j++) {
                 if (i == j) continue;
                 if (weights) {
-                    // weighted by number of points in cell j.
                     sum += dist[i][j] * cells[j].count;
                     totalWeight += cells[j].count;
                 } else {
@@ -173,7 +146,6 @@ std::vector<double> ras_dist(const std::vector<Record>& group,
         }
     }
 
-    // now assign each record the value computed for its cell.
     std::vector<double> result(group.size(), 0.0);
     for (size_t i = 0; i < group.size(); i++) {
         int cell_id = recordCellId[i];
@@ -181,6 +153,49 @@ std::vector<double> ras_dist(const std::vector<Record>& group,
         result[i] = cellValues[idx];
     }
     return result;
+}
+
+// function to load country centroids from a csv file
+std::vector<std::pair<double,double>> loadCentroidsCSV(const std::string& filename) {
+    std::vector<std::pair<double,double>> centroids;
+    std::ifstream file(filename);
+    if (!file.is_open()) {
+        std::cerr << "error: cannot open centroids csv file " << filename << std::endl;
+        return centroids;
+    }
+
+    std::string line;
+    if (!std::getline(file, line)) {
+        std::cerr << "error: empty centroids file or missing header." << std::endl;
+        return centroids;
+    }
+
+    while (std::getline(file, line)) {
+        std::stringstream ss(line);
+        std::string token;
+        double lonVal = std::numeric_limits<double>::quiet_NaN();
+        double latVal = std::numeric_limits<double>::quiet_NaN();
+
+        // assuming the csv columns are:
+        // type,iso3,area_sqkm,centroid.lon,centroid.lat,...
+        if (!std::getline(ss, token, ',')) continue; // type
+        if (!std::getline(ss, token, ',')) continue; // iso3
+        if (!std::getline(ss, token, ',')) continue; // area_sqkm
+        if (!std::getline(ss, token, ',')) continue; // centroid.lon
+        try {
+            lonVal = std::stod(token);
+        } catch(...) {}
+        if (!std::getline(ss, token, ',')) continue; // centroid.lat
+        try {
+            latVal = std::stod(token);
+        } catch(...) {}
+
+        if (!std::isnan(lonVal) && !std::isnan(latVal)) {
+            centroids.push_back(std::make_pair(lonVal, latVal));
+        }
+    }
+    std::cout << "loaded " << centroids.size() << " centroids from " << filename << std::endl;
+    return centroids;
 }
 
 // cc_val: validate coordinates
@@ -205,15 +220,12 @@ std::vector<Record> cc_outl(const std::vector<Record>& records,
                             int min_occs = 7,
                             bool thinning = false,
                             double thinning_res = 0.5) {
-    // group records by species.
     std::unordered_map<std::string, std::vector<Record>> speciesMap;
     for (const auto& rec : records) {
         speciesMap[rec.species].push_back(rec);
     }
-    // create a boolean vector to mark records that remain (true = keep).
     std::vector<bool> keep(records.size(), true);
 
-    // process each species group.
     for (const auto& kv : speciesMap) {
         const auto &group = kv.second;
         if (group.size() < static_cast<size_t>(min_occs)) {
@@ -221,23 +233,17 @@ std::vector<Record> cc_outl(const std::vector<Record>& records,
             continue;
         }
         size_t n = group.size();
-        std::vector<double> values(n, 0.0);  // will hold either min distances or mean distances
+        std::vector<double> values(n, 0.0);
 
-        // determine if we use raster approximation.
         bool raster_flag = (group.size() >= 10000) || thinning;
         if (raster_flag) {
-            // if thinning is true, we use simple mean (weights = false);
-            // otherwise, we use weighted mean.
             bool useWeights = (!thinning);
             if (method == "distance") {
-                // compute minimum distances using raster approximation.
                 values = ras_dist(group, thinning_res, useWeights, true);
             } else {
-                // compute mean distances using raster approximation.
                 values = ras_dist(group, thinning_res, useWeights, false);
             }
         } else {
-            // non-raster: compute full pairwise distances.
             if (method == "distance") {
                 std::vector<double> minDistances(n, std::numeric_limits<double>::max());
                 for (size_t i = 0; i < n; i++) {
@@ -250,7 +256,6 @@ std::vector<Record> cc_outl(const std::vector<Record>& records,
                 }
                 values = minDistances;
             } else {
-                // compute mean distances.
                 std::vector<double> meanDistances(n, 0.0);
                 for (size_t i = 0; i < n; i++) {
                     double sum = 0.0;
@@ -267,16 +272,13 @@ std::vector<Record> cc_outl(const std::vector<Record>& records,
             }
         }
 
-        // now flag records according to the method.
         if (method == "distance") {
-            // flag records if the (minimum) distance is greater than tdi.
             for (size_t i = 0; i < n; i++) {
                 if (values[i] > tdi) {
                     keep[group[i].row_id] = false;
                 }
             }
         } else if (method == "quantile") {
-            // compute quartiles and iqr.
             std::vector<double> sorted = values;
             std::sort(sorted.begin(), sorted.end());
             double q1 = sorted[sorted.size() / 4];
@@ -288,11 +290,9 @@ std::vector<Record> cc_outl(const std::vector<Record>& records,
                     keep[group[i].row_id] = false;
             }
         } else if (method == "mad") {
-            // compute median.
             std::vector<double> sorted = values;
             std::sort(sorted.begin(), sorted.end());
             double median = sorted[sorted.size() / 2];
-            // compute median absolute deviation (mad).
             std::vector<double> absDev;
             for (double v : values) {
                 absDev.push_back(std::abs(v - median));
@@ -306,7 +306,6 @@ std::vector<Record> cc_outl(const std::vector<Record>& records,
             }
         }
     }
-    // build result vector.
     std::vector<Record> result;
     for (size_t i = 0; i < records.size(); i++) {
         if (keep[i])
@@ -318,9 +317,8 @@ std::vector<Record> cc_outl(const std::vector<Record>& records,
 
 // cc_cen: remove records near country/province centroids
 std::vector<Record> cc_cen(const std::vector<Record>& records,
-                           const std::vector<std::pair<double,double>>& centroids, // pair<lon,lat>
+                           const std::vector<std::pair<double,double>>& centroids,
                            double buffer = 1000.0) {
-    // convert buffer from meters to kilometers.
     double buffer_km = buffer / 1000.0;
     std::vector<bool> keep(records.size(), true);
     for (size_t i = 0; i < records.size(); i++) {
@@ -345,7 +343,6 @@ std::vector<Record> cc_cen(const std::vector<Record>& records,
 std::vector<Record> cc_gbif(const std::vector<Record>& records,
                             double buffer = 1000.0,
                             bool geod = true) {
-    // gbif headquarters: (12.58, 55.67). buffer is in meters.
     double gbif_lon = 12.58;
     double gbif_lat = 55.67;
     double buffer_km = buffer / 1000.0;
@@ -364,7 +361,7 @@ std::vector<Record> cc_gbif(const std::vector<Record>& records,
     return result;
 }
 
-// load data from csv (expects header: species,decimallongitude,decimallatitude)
+// load data from csv (expects header: species,decimalLongitude,decimalLatitude)
 std::vector<Record> loadCSV(const std::string &filename) {
     std::vector<Record> records;
     std::ifstream file(filename);
@@ -373,18 +370,15 @@ std::vector<Record> loadCSV(const std::string &filename) {
         return records;
     }
     std::string line;
-    // read header
     std::getline(file, line);
     int row_id = 0;
     while (std::getline(file, line)) {
         std::stringstream ss(line);
         std::string token;
         Record rec;
-        // species
         if (!std::getline(ss, token, ','))
             continue;
         rec.species = token;
-        // longitude
         if (!std::getline(ss, token, ','))
             continue;
         try {
@@ -392,7 +386,6 @@ std::vector<Record> loadCSV(const std::string &filename) {
         } catch (...) {
             rec.lon = std::numeric_limits<double>::quiet_NaN();
         }
-        // latitude
         if (!std::getline(ss, token, ','))
             continue;
         try {
@@ -432,7 +425,6 @@ std::vector<Record> loadParquetDirectory(const std::string &directory) {
                 std::cerr << "error reading parquet table from file: " << file_path << std::endl;
                 continue;
             }
-            // assume required columns: "species", "decimallongitude", "decimallatitude"
             auto speciesArray = table->GetColumnByName("species");
             auto lonArray = table->GetColumnByName("decimalLongitude");
             auto latArray = table->GetColumnByName("decimalLatitude");
@@ -440,7 +432,6 @@ std::vector<Record> loadParquetDirectory(const std::string &directory) {
                 std::cerr << "error: missing required columns in parquet file: " << file_path << std::endl;
                 continue;
             }
-            // iterate over chunks and rows.
             for (int c = 0; c < speciesArray->num_chunks(); c++) {
                 auto speciesChunk = speciesArray->chunk(c);
                 auto lonChunk = lonArray->chunk(c);
@@ -478,12 +469,12 @@ std::vector<Record> loadParquetDirectory(const std::string &directory) {
 }
 
 int main() {
-    // input paths.
+    // input paths
     std::string parquetDir = "/users/njord888/desktop/myco_pkgs/bench_this/data/parquet_output";
     std::string csvFile = "/users/njord888/downloads/0023500-241107131044228.csv";
+    std::string centroidsCSV = "/users/njord888/countryref.csv";
     
     std::vector<Record> records;
-    // try to load from parquet directory first.
     if (fs::exists(parquetDir) && fs::is_directory(parquetDir)) {
         records = loadParquetDirectory(parquetDir);
         if (records.empty()) {
@@ -495,23 +486,20 @@ int main() {
         records = loadCSV(csvFile);
     }
     
-    // step 1: validate coordinates.
+    // step 1: validate coordinates
     records = cc_val(records);
     
-    // step 2: remove geographic outliers.
-    // here we use the "quantile" method (default) with raster approximation if necessary.
-    // you can adjust parameters as needed.
+    // step 2: remove geographic outliers
     records = cc_outl(records, "quantile", 5.0, 1000.0, 7, false, 0.5);
     
-    // step 3: remove records near country/province centroids.
-    // for demonstration, we use a dummy centroid (e.g., (0.0, 0.0)).
-    std::vector<std::pair<double,double>> centroids = { {0.0, 0.0} };
+    // step 3: load real centroids from csv and remove records near centroids
+    std::vector<std::pair<double,double>> centroids = loadCentroidsCSV(centroidsCSV);
     records = cc_cen(records, centroids, 1000.0);
     
-    // step 4: remove records near gbif headquarters.
+    // step 4: remove records near gbif headquarters
     records = cc_gbif(records, 1000.0, true);
     
-    // write final cleaned data to csv.
+    // write final cleaned data to csv
     std::ofstream outfile("cleaned_data.csv");
     if (!outfile.is_open()) {
         std::cerr << "error: cannot open output file for writing." << std::endl;
