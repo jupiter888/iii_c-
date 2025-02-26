@@ -13,10 +13,10 @@
 #include <unordered_map>
 #include <vector>
 #include <algorithm>
+#include <exception>
 
 namespace fs = std::filesystem;
 
-// structure for a record (row)
 struct Record {
     std::string species;
     double lon;
@@ -24,17 +24,15 @@ struct Record {
     int row_id;
 };
 
-// structure for a raster cell (used in raster approximation)
 struct RasterCell {
-    int id;                   // unique cell id (derived from grid coordinates)
-    double centroid_lon;      // center longitude of the cell
-    double centroid_lat;      // center latitude of the cell
-    int count;                // number of points in this cell
+    int id;
+    double centroid_lon;
+    double centroid_lat;
+    int count;
 };
 
-// haversine formula (returns distance in kilometers)
 double haversine(double lon1, double lat1, double lon2, double lat2) {
-    const double R = 6371.0; // earth's radius in km
+    const double R = 6371.0;
     double dlon = (lon2 - lon1) * M_PI / 180.0;
     double dlat = (lat2 - lat1) * M_PI / 180.0;
     double a = sin(dlat / 2) * sin(dlat / 2) +
@@ -44,23 +42,15 @@ double haversine(double lon1, double lat1, double lon2, double lat2) {
     return R * c;
 }
 
-/*
- * raster approximation function:
- *
- * for a given species group (vector of record) and a thinning resolution (in degrees),
- * this function builds a grid covering the group's extent.
- * each record is assigned to a grid cell.
- * for each unique cell, it computes the centroid (center of the cell) and counts
- * the number of records in that cell.
- * then it computes the distance matrix among these unique cells using the haversine formula.
- * if compute_min is true, the minimum distance from the cell to any other cell is computed;
- * otherwise, the mean distance is computed (weighted by cell count if weights is true).
- * each record is then assigned the computed value for its cell.
- */
-std::vector<double> ras_dist(const std::vector<Record>& group,
-                             double thinning_res,
-                             bool weights,
-                             bool compute_min) {
+std::vector<Record> reassign_row_ids(const std::vector<Record>& records) {
+    std::vector<Record> newRecords = records;
+    for (size_t i = 0; i < newRecords.size(); i++) {
+        newRecords[i].row_id = static_cast<int>(i);
+    }
+    return newRecords;
+}
+
+std::vector<double> ras_dist(const std::vector<Record>& group, double thinning_res, bool weights, bool compute_min) {
     double min_lon = std::numeric_limits<double>::max();
     double max_lon = std::numeric_limits<double>::lowest();
     double min_lat = std::numeric_limits<double>::max();
@@ -71,13 +61,10 @@ std::vector<double> ras_dist(const std::vector<Record>& group,
         if (rec.lat < min_lat) min_lat = rec.lat;
         if (rec.lat > max_lat) max_lat = rec.lat;
     }
-
     int ncols = static_cast<int>(std::ceil((max_lon - min_lon) / thinning_res));
     int nrows = static_cast<int>(std::ceil((max_lat - min_lat) / thinning_res));
-
     std::unordered_map<int, RasterCell> cellMap;
     std::vector<int> recordCellId(group.size(), -1);
-
     for (size_t i = 0; i < group.size(); i++) {
         int cell_x = static_cast<int>(std::floor((group[i].lon - min_lon) / thinning_res));
         int cell_y = static_cast<int>(std::floor((group[i].lat - min_lat) / thinning_res));
@@ -91,21 +78,18 @@ std::vector<double> ras_dist(const std::vector<Record>& group,
             cellMap[cell_id].count += 1;
         }
     }
-
     std::vector<RasterCell> cells;
     std::unordered_map<int, int> cellIdToIndex;
     for (const auto& kv : cellMap) {
         cellIdToIndex[kv.first] = static_cast<int>(cells.size());
         cells.push_back(kv.second);
     }
-
     int U = cells.size();
     std::vector<double> cellValues(U, 0.0);
     if (U < 2) {
         std::vector<double> result(group.size(), 0.0);
         return result;
     }
-
     std::vector<std::vector<double>> dist(U, std::vector<double>(U, 0.0));
     for (int i = 0; i < U; i++) {
         for (int j = 0; j < U; j++) {
@@ -117,7 +101,6 @@ std::vector<double> ras_dist(const std::vector<Record>& group,
             }
         }
     }
-
     for (int i = 0; i < U; i++) {
         if (compute_min) {
             double minD = std::numeric_limits<double>::max();
@@ -145,7 +128,6 @@ std::vector<double> ras_dist(const std::vector<Record>& group,
                                      : (count > 0 ? sum / count : 0.0));
         }
     }
-
     std::vector<double> result(group.size(), 0.0);
     for (size_t i = 0; i < group.size(); i++) {
         int cell_id = recordCellId[i];
@@ -155,14 +137,6 @@ std::vector<double> ras_dist(const std::vector<Record>& group,
     return result;
 }
 
-/*
- * loadCentroidsCSV function:
- *
- * this function loads country/province centroids from a CSV file.
- * it first reads the header and verifies that the required columns "centroid.lon"
- * and "centroid.lat" are present. if not, it prints an error.
- * if they are present, it uses their indices to extract the values from each row.
- */
 std::vector<std::pair<double,double>> loadCentroidsCSV(const std::string& filename) {
     std::vector<std::pair<double,double>> centroids;
     std::ifstream file(filename);
@@ -181,16 +155,14 @@ std::vector<std::pair<double,double>> loadCentroidsCSV(const std::string& filena
     while (std::getline(headerStream, col, ',')) {
         headerTokens.push_back(col);
     }
-    int lonIndex = -1;
-    int latIndex = -1;
+    int lonIndex = -1, latIndex = -1;
     for (size_t i = 0; i < headerTokens.size(); i++) {
         std::string token = headerTokens[i];
         std::transform(token.begin(), token.end(), token.begin(), ::tolower);
-        if (token == "centroid.lon") {
-            lonIndex = i;
-        } else if (token == "centroid.lat") {
-            latIndex = i;
-        }
+        if (token == "centroid.lon")
+            lonIndex = static_cast<int>(i);
+        else if (token == "centroid.lat")
+            latIndex = static_cast<int>(i);
     }
     if (lonIndex == -1 || latIndex == -1) {
         std::cerr << "error: header does not contain required columns 'centroid.lon' and 'centroid.lat'" << std::endl;
@@ -222,7 +194,6 @@ std::vector<std::pair<double,double>> loadCentroidsCSV(const std::string& filena
     return centroids;
 }
 
-// cc_val: validate coordinates
 std::vector<Record> cc_val(const std::vector<Record>& records) {
     std::vector<Record> valid;
     for (const auto& rec : records) {
@@ -236,14 +207,9 @@ std::vector<Record> cc_val(const std::vector<Record>& records) {
     return valid;
 }
 
-// cc_outl: identify geographic outliers with support for raster estimation
-std::vector<Record> cc_outl(const std::vector<Record>& records,
-                            const std::string &method = "quantile",
-                            double mltpl = 5.0,
-                            double tdi = 1000.0,
-                            int min_occs = 7,
-                            bool thinning = false,
-                            double thinning_res = 0.5) {
+std::vector<Record> cc_outl(const std::vector<Record>& records, const std::string &method = "quantile",
+                            double mltpl = 5.0, double tdi = 1000.0, int min_occs = 7,
+                            bool thinning = false, double thinning_res = 0.5) {
     std::unordered_map<std::string, std::vector<Record>> speciesMap;
     for (const auto& rec : records) {
         speciesMap[rec.species].push_back(rec);
@@ -336,10 +302,7 @@ std::vector<Record> cc_outl(const std::vector<Record>& records,
     return result;
 }
 
-// cc_cen: remove records near country/province centroids
-std::vector<Record> cc_cen(const std::vector<Record>& records,
-                           const std::vector<std::pair<double,double>>& centroids,
-                           double buffer = 1000.0) {
+std::vector<Record> cc_cen(const std::vector<Record>& records, const std::vector<std::pair<double,double>>& centroids, double buffer = 1000.0) {
     double buffer_km = buffer / 1000.0;
     std::vector<bool> keep(records.size(), true);
     for (size_t i = 0; i < records.size(); i++) {
@@ -360,10 +323,7 @@ std::vector<Record> cc_cen(const std::vector<Record>& records,
     return result;
 }
 
-// cc_gbif: remove records near gbif headquarters (fixed coordinate)
-std::vector<Record> cc_gbif(const std::vector<Record>& records,
-                            double buffer = 1000.0,
-                            bool geod = true) {
+std::vector<Record> cc_gbif(const std::vector<Record>& records, double buffer = 1000.0, bool geod = true) {
     double gbif_lon = 12.58;
     double gbif_lat = 55.67;
     double buffer_km = buffer / 1000.0;
@@ -382,7 +342,6 @@ std::vector<Record> cc_gbif(const std::vector<Record>& records,
     return result;
 }
 
-// load data from csv (expects header: species,decimalLongitude,decimalLatitude)
 std::vector<Record> loadCSV(const std::string &filename) {
     std::vector<Record> records;
     std::ifstream file(filename);
@@ -421,68 +380,73 @@ std::vector<Record> loadCSV(const std::string &filename) {
     return records;
 }
 
-// load data from a directory of parquet files
 std::vector<Record> loadParquetDirectory(const std::string &directory) {
     std::vector<Record> records;
     int row_id = 0;
     for (const auto &entry : fs::directory_iterator(directory)) {
         if (entry.path().extension() == ".parquet") {
             std::string file_path = entry.path().string();
-            std::shared_ptr<arrow::io::ReadableFile> infile;
-            auto status = arrow::io::ReadableFile::Open(file_path, &infile);
-            if (!status.ok()) {
-                std::cerr << "error opening parquet file: " << file_path << std::endl;
-                continue;
-            }
-            std::unique_ptr<parquet::arrow::FileReader> reader;
-            status = parquet::arrow::OpenFile(infile, arrow::default_memory_pool(), &reader);
-            if (!status.ok()) {
-                std::cerr << "error creating parquet reader for file: " << file_path << std::endl;
-                continue;
-            }
-            std::shared_ptr<arrow::Table> table;
-            status = reader->ReadTable(&table);
-            if (!status.ok()) {
-                std::cerr << "error reading parquet table from file: " << file_path << std::endl;
-                continue;
-            }
-            auto speciesArray = table->GetColumnByName("species");
-            auto lonArray = table->GetColumnByName("decimalLongitude");
-            auto latArray = table->GetColumnByName("decimalLatitude");
-            if (!speciesArray || !lonArray || !latArray) {
-                std::cerr << "error: missing required columns in parquet file: " << file_path << std::endl;
-                continue;
-            }
-            for (int c = 0; c < speciesArray->num_chunks(); c++) {
-                auto speciesChunk = speciesArray->chunk(c);
-                auto lonChunk = lonArray->chunk(c);
-                auto latChunk = latArray->chunk(c);
-                int64_t num_rows = speciesChunk->length();
-                for (int64_t i = 0; i < num_rows; i++) {
-                    Record rec;
-                    auto speciesScalarResult = speciesChunk->GetScalar(i);
-                    if (!speciesScalarResult.ok())
-                        continue;
-                    auto speciesScalar = std::static_pointer_cast<arrow::StringScalar>(speciesScalarResult.ValueOrDie());
-                    rec.species = speciesScalar->value->ToString();
-                    
-                    auto lonScalarResult = lonChunk->GetScalar(i);
-                    if (!lonScalarResult.ok())
-                        continue;
-                    auto lonScalar = std::static_pointer_cast<arrow::DoubleScalar>(lonScalarResult.ValueOrDie());
-                    rec.lon = lonScalar->value;
-                    
-                    auto latScalarResult = latChunk->GetScalar(i);
-                    if (!latScalarResult.ok())
-                        continue;
-                    auto latScalar = std::static_pointer_cast<arrow::DoubleScalar>(latScalarResult.ValueOrDie());
-                    rec.lat = latScalar->value;
-                    
-                    rec.row_id = row_id++;
-                    records.push_back(rec);
+            try {
+                auto infile_result = arrow::io::ReadableFile::Open(file_path, arrow::default_memory_pool());
+                if (!infile_result.ok()){
+                    std::cerr << "error opening parquet file: " << file_path << std::endl;
+                    continue;
                 }
+                std::shared_ptr<arrow::io::ReadableFile> infile = infile_result.ValueOrDie();
+                auto reader_result = parquet::arrow::OpenFile(infile, arrow::default_memory_pool());
+                if (!reader_result.ok()){
+                    std::cerr << "error creating parquet reader for file: " << file_path << std::endl;
+                    continue;
+                }
+                std::unique_ptr<parquet::arrow::FileReader> reader = std::move(reader_result.ValueOrDie());
+                std::shared_ptr<arrow::Table> table;
+                auto status = reader->ReadTable(&table);
+                if (!status.ok() || table == nullptr) {
+                    std::cerr << "error reading parquet table from file: " << file_path << std::endl;
+                    continue;
+                }
+                auto speciesArray = table->GetColumnByName("species");
+                auto lonArray = table->GetColumnByName("decimalLongitude");
+                auto latArray = table->GetColumnByName("decimalLatitude");
+                if (!speciesArray || !lonArray || !latArray) {
+                    std::cerr << "error: missing required columns in parquet file: " << file_path << std::endl;
+                    continue;
+                }
+                for (int c = 0; c < speciesArray->num_chunks(); c++) {
+                    auto speciesChunk = speciesArray->chunk(c);
+                    auto lonChunk = lonArray->chunk(c);
+                    auto latChunk = latArray->chunk(c);
+                    int64_t num_rows = speciesChunk->length();
+                    for (int64_t i = 0; i < num_rows; i++) {
+                        try {
+                            Record rec;
+                            auto speciesScalarResult = speciesChunk->GetScalar(i);
+                            if (!speciesScalarResult.ok())
+                                continue;
+                            auto speciesScalar = std::static_pointer_cast<arrow::StringScalar>(speciesScalarResult.ValueOrDie());
+                            rec.species = speciesScalar->value->ToString();
+                            auto lonScalarResult = lonChunk->GetScalar(i);
+                            if (!lonScalarResult.ok())
+                                continue;
+                            auto lonScalar = std::static_pointer_cast<arrow::DoubleScalar>(lonScalarResult.ValueOrDie());
+                            rec.lon = lonScalar->value;
+                            auto latScalarResult = latChunk->GetScalar(i);
+                            if (!latScalarResult.ok())
+                                continue;
+                            auto latScalar = std::static_pointer_cast<arrow::DoubleScalar>(latScalarResult.ValueOrDie());
+                            rec.lat = latScalar->value;
+                            rec.row_id = row_id++;
+                            records.push_back(rec);
+                        } catch (const std::exception &ex) {
+                            std::cerr << "exception processing row " << i << " in file: " << file_path << " error: " << ex.what() << std::endl;
+                        }
+                    }
+                }
+                std::cout << "loaded records from file: " << file_path << std::endl;
+            } catch (const std::exception &ex) {
+                std::cerr << "exception processing file: " << file_path << " error: " << ex.what() << std::endl;
+                continue;
             }
-            std::cout << "loaded records from file: " << file_path << std::endl;
         }
     }
     std::cout << "total records loaded from parquet: " << records.size() << std::endl;
@@ -490,7 +454,6 @@ std::vector<Record> loadParquetDirectory(const std::string &directory) {
 }
 
 int main() {
-    // input paths
     std::string parquetDir = "/users/njord888/desktop/myco_pkgs/bench_this/data/parquet_output";
     std::string csvFile = "/users/njord888/downloads/0023500-241107131044228.csv";
     std::string centroidsCSV = "/users/njord888/countryref.csv";
@@ -507,20 +470,16 @@ int main() {
         records = loadCSV(csvFile);
     }
     
-    // step 1: validate coordinates
     records = cc_val(records);
-    
-    // step 2: remove geographic outliers
+    records = reassign_row_ids(records);
     records = cc_outl(records, "quantile", 5.0, 1000.0, 7, false, 0.5);
-    
-    // step 3: load real centroids from csv and remove records near centroids
+    records = reassign_row_ids(records);
     std::vector<std::pair<double,double>> centroids = loadCentroidsCSV(centroidsCSV);
     records = cc_cen(records, centroids, 1000.0);
-    
-    // step 4: remove records near gbif headquarters
+    records = reassign_row_ids(records);
     records = cc_gbif(records, 1000.0, true);
+    records = reassign_row_ids(records);
     
-    // write final cleaned data to csv
     std::ofstream outfile("cleaned_data.csv");
     if (!outfile.is_open()) {
         std::cerr << "error: cannot open output file for writing." << std::endl;
