@@ -14,6 +14,9 @@
 #include <vector>
 #include <algorithm>
 #include <exception>
+#include <csignal>
+#include <cstdlib>
+#include <system_error>
 
 namespace fs = std::filesystem;
 
@@ -50,7 +53,10 @@ std::vector<Record> reassign_row_ids(const std::vector<Record>& records) {
     return newRecords;
 }
 
-std::vector<double> ras_dist(const std::vector<Record>& group, double thinning_res, bool weights, bool compute_min) {
+std::vector<double> ras_dist(const std::vector<Record>& group,
+                             double thinning_res,
+                             bool weights,
+                             bool compute_min) {
     double min_lon = std::numeric_limits<double>::max();
     double max_lon = std::numeric_limits<double>::lowest();
     double min_lat = std::numeric_limits<double>::max();
@@ -386,6 +392,17 @@ std::vector<Record> loadParquetDirectory(const std::string &directory) {
     for (const auto &entry : fs::directory_iterator(directory)) {
         if (entry.path().extension() == ".parquet") {
             std::string file_path = entry.path().string();
+            std::cout << "processing file: " << file_path << std::endl;
+            std::error_code ec;
+            auto fsize = fs::file_size(entry.path(), ec);
+            if(ec) {
+                std::cerr << "error getting file size for: " << file_path << std::endl;
+                continue;
+            }
+            if(fsize == 0) {
+                std::cerr << "file " << file_path << " is empty, skipping." << std::endl;
+                continue;
+            }
             try {
                 auto infile_result = arrow::io::ReadableFile::Open(file_path, arrow::default_memory_pool());
                 if (!infile_result.ok()){
@@ -403,6 +420,10 @@ std::vector<Record> loadParquetDirectory(const std::string &directory) {
                 auto status = reader->ReadTable(&table);
                 if (!status.ok() || table == nullptr) {
                     std::cerr << "error reading parquet table from file: " << file_path << std::endl;
+                    continue;
+                }
+                if(table->num_rows() == 0) {
+                    std::cerr << "parquet file " << file_path << " has no rows, skipping." << std::endl;
                     continue;
                 }
                 auto speciesArray = table->GetColumnByName("species");
@@ -438,13 +459,15 @@ std::vector<Record> loadParquetDirectory(const std::string &directory) {
                             rec.row_id = row_id++;
                             records.push_back(rec);
                         } catch (const std::exception &ex) {
-                            std::cerr << "exception processing row " << i << " in file: " << file_path << " error: " << ex.what() << std::endl;
+                            std::cerr << "exception processing row " << i << " in file: " << file_path 
+                                      << " error: " << ex.what() << std::endl;
                         }
                     }
                 }
                 std::cout << "loaded records from file: " << file_path << std::endl;
             } catch (const std::exception &ex) {
-                std::cerr << "exception processing file: " << file_path << " error: " << ex.what() << std::endl;
+                std::cerr << "exception processing file: " << file_path 
+                          << " error: " << ex.what() << std::endl;
                 continue;
             }
         }
@@ -453,7 +476,14 @@ std::vector<Record> loadParquetDirectory(const std::string &directory) {
     return records;
 }
 
+void segfault_handler(int signum) {
+    std::cerr << "segmentation fault (signal " << signum << ") occurred." << std::endl;
+    std::exit(signum);
+}
+
 int main() {
+    std::signal(SIGSEGV, segfault_handler);
+
     std::string parquetDir = "/users/njord888/desktop/myco_pkgs/bench_this/data/parquet_output";
     std::string csvFile = "/users/njord888/downloads/0023500-241107131044228.csv";
     std::string centroidsCSV = "/users/njord888/countryref.csv";
