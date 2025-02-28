@@ -484,7 +484,7 @@ void segfault_handler(int signum) {
 int main() {
     std::signal(SIGSEGV, segfault_handler);
 
-    std::string parquetDir = "/users/njord888/desktop/myco_pkgs/bench_this/data/parquet_output";
+    std::string parquetDir = "/Users/njord888/Desktop/myco_pkgs/bench_this/data/parquet_output_new";
     std::string csvFile = "/users/njord888/downloads/0023500-241107131044228.csv";
     std::string centroidsCSV = "/users/njord888/countryref.csv";
     
