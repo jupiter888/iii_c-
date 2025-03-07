@@ -21,9 +21,12 @@
 namespace fs = std::filesystem;
 
 struct Record {
+    std::string gbifID;
     std::string species;
-    double lon;
-    double lat;
+    std::string countryCode;
+    double lon;          // decimalLongitude
+    double lat;          // decimalLatitude
+    std::string eventDate;
     int row_id;
 };
 
@@ -178,9 +181,8 @@ std::vector<std::pair<double,double>> loadCentroidsCSV(const std::string& filena
     while (std::getline(file, line)) {
         std::stringstream ss(line);
         std::vector<std::string> tokens;
-        std::string token;
-        while (std::getline(ss, token, ',')) {
-            tokens.push_back(token);
+        while (std::getline(ss, col, ',')) {
+            tokens.push_back(col);
         }
         if (tokens.size() <= static_cast<size_t>(std::max(lonIndex, latIndex)))
             continue;
@@ -355,30 +357,69 @@ std::vector<Record> loadCSV(const std::string &filename) {
         std::cerr << "error: cannot open csv file " << filename << std::endl;
         return records;
     }
-    std::string line;
-    std::getline(file, line);
+    std::string header;
+    if (!std::getline(file, header)) {
+        std::cerr << "error: csv file " << filename << " is empty." << std::endl;
+        return records;
+    }
+    std::vector<std::string> headerTokens;
+    std::stringstream headerStream(header);
+    std::string token;
+    while (std::getline(headerStream, token, ',')) {
+        headerTokens.push_back(token);
+    }
+    // convert header tokens to lowercase for matching
+    std::vector<std::string> lowerHeader;
+    for (auto& t : headerTokens) {
+        std::string lt = t;
+        std::transform(lt.begin(), lt.end(), lt.begin(), ::tolower);
+        lowerHeader.push_back(lt);
+    }
+    // required columns (case-insensitive)
+    int idx_gbifID = -1, idx_species = -1, idx_countryCode = -1, idx_decimalLatitude = -1, idx_decimalLongitude = -1, idx_eventDate = -1;
+    for (size_t i = 0; i < lowerHeader.size(); i++) {
+        if (lowerHeader[i] == "gbifid")
+            idx_gbifID = static_cast<int>(i);
+        else if (lowerHeader[i] == "species")
+            idx_species = static_cast<int>(i);
+        else if (lowerHeader[i] == "countrycode")
+            idx_countryCode = static_cast<int>(i);
+        else if (lowerHeader[i] == "decimallatitude")
+            idx_decimalLatitude = static_cast<int>(i);
+        else if (lowerHeader[i] == "decimallongitude")
+            idx_decimalLongitude = static_cast<int>(i);
+        else if (lowerHeader[i] == "eventdate")
+            idx_eventDate = static_cast<int>(i);
+    }
+    if (idx_gbifID == -1 || idx_species == -1 || idx_countryCode == -1 ||
+        idx_decimalLatitude == -1 || idx_decimalLongitude == -1 || idx_eventDate == -1) {
+        std::cerr << "error: one or more required columns are missing in the CSV header." << std::endl;
+        return records;
+    }
     int row_id = 0;
+    std::string line;
     while (std::getline(file, line)) {
         std::stringstream ss(line);
-        std::string token;
-        Record rec;
-        if (!std::getline(ss, token, ','))
-            continue;
-        rec.species = token;
-        if (!std::getline(ss, token, ','))
-            continue;
-        try {
-            rec.lon = std::stod(token);
-        } catch (...) {
-            rec.lon = std::numeric_limits<double>::quiet_NaN();
+        std::vector<std::string> tokens;
+        while (std::getline(ss, token, ',')) {
+            tokens.push_back(token);
         }
-        if (!std::getline(ss, token, ','))
-            continue;
+        if (tokens.size() < lowerHeader.size()) continue;
+        Record rec;
+        rec.gbifID = tokens[idx_gbifID];
+        rec.species = tokens[idx_species];
+        rec.countryCode = tokens[idx_countryCode];
         try {
-            rec.lat = std::stod(token);
-        } catch (...) {
+            rec.lat = std::stod(tokens[idx_decimalLatitude]);
+        } catch(...) {
             rec.lat = std::numeric_limits<double>::quiet_NaN();
         }
+        try {
+            rec.lon = std::stod(tokens[idx_decimalLongitude]);
+        } catch(...) {
+            rec.lon = std::numeric_limits<double>::quiet_NaN();
+        }
+        rec.eventDate = tokens[idx_eventDate];
         rec.row_id = row_id++;
         records.push_back(rec);
     }
@@ -386,119 +427,17 @@ std::vector<Record> loadCSV(const std::string &filename) {
     return records;
 }
 
-std::vector<Record> loadParquetDirectory(const std::string &directory) {
-    std::vector<Record> records;
-    int row_id = 0;
-    for (const auto &entry : fs::directory_iterator(directory)) {
-        if (entry.path().extension() == ".parquet") {
-            std::string file_path = entry.path().string();
-            std::cout << "processing file: " << file_path << std::endl;
-            std::error_code ec;
-            auto fsize = fs::file_size(entry.path(), ec);
-            if(ec) {
-                std::cerr << "error getting file size for: " << file_path << std::endl;
-                continue;
-            }
-            if(fsize == 0) {
-                std::cerr << "file " << file_path << " is empty, skipping." << std::endl;
-                continue;
-            }
-            try {
-                auto infile_result = arrow::io::ReadableFile::Open(file_path, arrow::default_memory_pool());
-                if (!infile_result.ok()){
-                    std::cerr << "error opening parquet file: " << file_path << std::endl;
-                    continue;
-                }
-                std::shared_ptr<arrow::io::ReadableFile> infile = infile_result.ValueOrDie();
-                auto reader_result = parquet::arrow::OpenFile(infile, arrow::default_memory_pool());
-                if (!reader_result.ok()){
-                    std::cerr << "error creating parquet reader for file: " << file_path << std::endl;
-                    continue;
-                }
-                std::unique_ptr<parquet::arrow::FileReader> reader = std::move(reader_result.ValueOrDie());
-                std::shared_ptr<arrow::Table> table;
-                auto status = reader->ReadTable(&table);
-                if (!status.ok() || table == nullptr) {
-                    std::cerr << "error reading parquet table from file: " << file_path << std::endl;
-                    continue;
-                }
-                if(table->num_rows() == 0) {
-                    std::cerr << "parquet file " << file_path << " has no rows, skipping." << std::endl;
-                    continue;
-                }
-                auto speciesArray = table->GetColumnByName("species");
-                auto lonArray = table->GetColumnByName("decimalLongitude");
-                auto latArray = table->GetColumnByName("decimalLatitude");
-                if (!speciesArray || !lonArray || !latArray) {
-                    std::cerr << "error: missing required columns in parquet file: " << file_path << std::endl;
-                    continue;
-                }
-                for (int c = 0; c < speciesArray->num_chunks(); c++) {
-                    auto speciesChunk = speciesArray->chunk(c);
-                    auto lonChunk = lonArray->chunk(c);
-                    auto latChunk = latArray->chunk(c);
-                    int64_t num_rows = speciesChunk->length();
-                    for (int64_t i = 0; i < num_rows; i++) {
-                        try {
-                            Record rec;
-                            auto speciesScalarResult = speciesChunk->GetScalar(i);
-                            if (!speciesScalarResult.ok())
-                                continue;
-                            auto speciesScalar = std::static_pointer_cast<arrow::StringScalar>(speciesScalarResult.ValueOrDie());
-                            rec.species = speciesScalar->value->ToString();
-                            auto lonScalarResult = lonChunk->GetScalar(i);
-                            if (!lonScalarResult.ok())
-                                continue;
-                            auto lonScalar = std::static_pointer_cast<arrow::DoubleScalar>(lonScalarResult.ValueOrDie());
-                            rec.lon = lonScalar->value;
-                            auto latScalarResult = latChunk->GetScalar(i);
-                            if (!latScalarResult.ok())
-                                continue;
-                            auto latScalar = std::static_pointer_cast<arrow::DoubleScalar>(latScalarResult.ValueOrDie());
-                            rec.lat = latScalar->value;
-                            rec.row_id = row_id++;
-                            records.push_back(rec);
-                        } catch (const std::exception &ex) {
-                            std::cerr << "exception processing row " << i << " in file: " << file_path 
-                                      << " error: " << ex.what() << std::endl;
-                        }
-                    }
-                }
-                std::cout << "loaded records from file: " << file_path << std::endl;
-            } catch (const std::exception &ex) {
-                std::cerr << "exception processing file: " << file_path 
-                          << " error: " << ex.what() << std::endl;
-                continue;
-            }
-        }
-    }
-    std::cout << "total records loaded from parquet: " << records.size() << std::endl;
-    return records;
-}
-
-void segfault_handler(int signum) {
-    std::cerr << "segmentation fault (signal " << signum << ") occurred." << std::endl;
-    std::exit(signum);
-}
-
 int main() {
-    std::signal(SIGSEGV, segfault_handler);
+    std::signal(SIGSEGV, [](int signum) {
+        std::cerr << "segmentation fault (signal " << signum << ") occurred." << std::endl;
+        std::exit(signum);
+    });
 
-    std::string parquetDir = "/Users/njord888/Desktop/myco_pkgs/bench_this/data/parquet_output_new";
-    std::string csvFile = "/users/njord888/downloads/0023500-241107131044228.csv";
-    std::string centroidsCSV = "/users/njord888/countryref.csv";
+    // Use CSV since the Parquet data is corrupt
+    std::string csvFile = "/Users/njord888/downloads/0023500-241107131044228.csv";
+    std::string centroidsCSV = "/Users/njord888/countryref.csv";
     
-    std::vector<Record> records;
-    if (fs::exists(parquetDir) && fs::is_directory(parquetDir)) {
-        records = loadParquetDirectory(parquetDir);
-        if (records.empty()) {
-            std::cout << "no records loaded from parquet. falling back to csv." << std::endl;
-            records = loadCSV(csvFile);
-        }
-    } else {
-        std::cout << "parquet directory not found. loading csv." << std::endl;
-        records = loadCSV(csvFile);
-    }
+    std::vector<Record> records = loadCSV(csvFile);
     
     records = cc_val(records);
     records = reassign_row_ids(records);
@@ -515,9 +454,10 @@ int main() {
         std::cerr << "error: cannot open output file for writing." << std::endl;
         return 1;
     }
-    outfile << "species,decimalLongitude,decimalLatitude\n";
+    outfile << "gbifID,species,countryCode,decimalLongitude,decimalLatitude,eventDate\n";
     for (const auto &rec : records) {
-        outfile << rec.species << "," << rec.lon << "," << rec.lat << "\n";
+        outfile << rec.gbifID << "," << rec.species << "," << rec.countryCode << ","
+                << rec.lon << "," << rec.lat << "," << rec.eventDate << "\n";
     }
     outfile.close();
     
