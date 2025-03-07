@@ -56,10 +56,7 @@ std::vector<Record> reassign_row_ids(const std::vector<Record>& records) {
     return newRecords;
 }
 
-std::vector<double> ras_dist(const std::vector<Record>& group,
-                             double thinning_res,
-                             bool weights,
-                             bool compute_min) {
+std::vector<double> ras_dist(const std::vector<Record>& group, double thinning_res, bool weights, bool compute_min) {
     double min_lon = std::numeric_limits<double>::max();
     double max_lon = std::numeric_limits<double>::lowest();
     double min_lat = std::numeric_limits<double>::max();
@@ -350,6 +347,17 @@ std::vector<Record> cc_gbif(const std::vector<Record>& records, double buffer = 
     return result;
 }
 
+// Helper function to split a line given a delimiter.
+std::vector<std::string> split_line(const std::string &line, char delim) {
+    std::vector<std::string> tokens;
+    std::stringstream ss(line);
+    std::string token;
+    while (std::getline(ss, token, delim)) {
+        tokens.push_back(token);
+    }
+    return tokens;
+}
+
 std::vector<Record> loadCSV(const std::string &filename) {
     std::vector<Record> records;
     std::ifstream file(filename);
@@ -362,20 +370,18 @@ std::vector<Record> loadCSV(const std::string &filename) {
         std::cerr << "error: csv file " << filename << " is empty." << std::endl;
         return records;
     }
-    std::vector<std::string> headerTokens;
-    std::stringstream headerStream(header);
-    std::string token;
-    while (std::getline(headerStream, token, ',')) {
-        headerTokens.push_back(token);
-    }
-    // convert header tokens to lowercase for matching
+    // Detect delimiter: if header contains a tab, use '\t', otherwise use ','
+    char delim = (header.find('\t') != std::string::npos) ? '\t' : ',';
+    
+    std::vector<std::string> headerTokens = split_line(header, delim);
+    // Convert header tokens to lowercase for matching
     std::vector<std::string> lowerHeader;
     for (auto& t : headerTokens) {
         std::string lt = t;
         std::transform(lt.begin(), lt.end(), lt.begin(), ::tolower);
         lowerHeader.push_back(lt);
     }
-    // required columns (case-insensitive)
+    // Required columns (case-insensitive)
     int idx_gbifID = -1, idx_species = -1, idx_countryCode = -1, idx_decimalLatitude = -1, idx_decimalLongitude = -1, idx_eventDate = -1;
     for (size_t i = 0; i < lowerHeader.size(); i++) {
         if (lowerHeader[i] == "gbifid")
@@ -399,12 +405,9 @@ std::vector<Record> loadCSV(const std::string &filename) {
     int row_id = 0;
     std::string line;
     while (std::getline(file, line)) {
-        std::stringstream ss(line);
-        std::vector<std::string> tokens;
-        while (std::getline(ss, token, ',')) {
-            tokens.push_back(token);
-        }
-        if (tokens.size() < lowerHeader.size()) continue;
+        std::vector<std::string> tokens = split_line(line, delim);
+        if (tokens.size() < lowerHeader.size())
+            continue;
         Record rec;
         rec.gbifID = tokens[idx_gbifID];
         rec.species = tokens[idx_species];
@@ -427,13 +430,15 @@ std::vector<Record> loadCSV(const std::string &filename) {
     return records;
 }
 
-int main() {
-    std::signal(SIGSEGV, [](int signum) {
-        std::cerr << "segmentation fault (signal " << signum << ") occurred." << std::endl;
-        std::exit(signum);
-    });
+void segfault_handler(int signum) {
+    std::cerr << "segmentation fault (signal " << signum << ") occurred." << std::endl;
+    std::exit(signum);
+}
 
-    // Use CSV since the Parquet data is corrupt
+int main() {
+    std::signal(SIGSEGV, segfault_handler);
+
+    // Use CSV because Parquet is corrupt
     std::string csvFile = "/Users/njord888/downloads/0023500-241107131044228.csv";
     std::string centroidsCSV = "/Users/njord888/countryref.csv";
     
