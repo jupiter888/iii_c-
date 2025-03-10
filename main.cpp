@@ -20,6 +20,15 @@
 
 namespace fs = std::filesystem;
 
+// helper function to trim whitespace and surrounding quotes from a string
+std::string trim(const std::string& s) {
+    size_t start = s.find_first_not_of(" \t\n\r\"");
+    size_t end = s.find_last_not_of(" \t\n\r\"");
+    if (start == std::string::npos || end == std::string::npos)
+        return "";
+    return s.substr(start, end - start + 1);
+}
+
 struct Record {
     std::string gbifID;
     std::string species;
@@ -155,19 +164,20 @@ std::vector<std::pair<double,double>> loadCentroidsCSV(const std::string& filena
         std::cerr << "error: empty centroids file or missing header." << std::endl;
         return centroids;
     }
+    // Split header and trim each token
     std::vector<std::string> headerTokens;
     std::stringstream headerStream(headerLine);
-    std::string col;
-    while (std::getline(headerStream, col, ',')) {
-        headerTokens.push_back(col);
+    std::string token;
+    while (std::getline(headerStream, token, ',')) {
+        headerTokens.push_back(trim(token));
     }
     int lonIndex = -1, latIndex = -1;
     for (size_t i = 0; i < headerTokens.size(); i++) {
-        std::string token = headerTokens[i];
-        std::transform(token.begin(), token.end(), token.begin(), ::tolower);
-        if (token == "centroid.lon")
+        std::string lowerToken = headerTokens[i];
+        std::transform(lowerToken.begin(), lowerToken.end(), lowerToken.begin(), ::tolower);
+        if (lowerToken == "centroid.lon")
             lonIndex = static_cast<int>(i);
-        else if (token == "centroid.lat")
+        else if (lowerToken == "centroid.lat")
             latIndex = static_cast<int>(i);
     }
     if (lonIndex == -1 || latIndex == -1) {
@@ -178,8 +188,8 @@ std::vector<std::pair<double,double>> loadCentroidsCSV(const std::string& filena
     while (std::getline(file, line)) {
         std::stringstream ss(line);
         std::vector<std::string> tokens;
-        while (std::getline(ss, col, ',')) {
-            tokens.push_back(col);
+        while (std::getline(ss, token, ',')) {
+            tokens.push_back(trim(token));
         }
         if (tokens.size() <= static_cast<size_t>(std::max(lonIndex, latIndex)))
             continue;
@@ -347,7 +357,6 @@ std::vector<Record> cc_gbif(const std::vector<Record>& records, double buffer = 
     return result;
 }
 
-// Helper function to split a line given a delimiter.
 std::vector<std::string> split_line(const std::string &line, char delim) {
     std::vector<std::string> tokens;
     std::stringstream ss(line);
@@ -370,18 +379,18 @@ std::vector<Record> loadCSV(const std::string &filename) {
         std::cerr << "error: csv file " << filename << " is empty." << std::endl;
         return records;
     }
-    // Detect delimiter: if header contains a tab, use '\t', otherwise use ','
+    // detect delimiter: use tab if present, otherwise comma
     char delim = (header.find('\t') != std::string::npos) ? '\t' : ',';
     
     std::vector<std::string> headerTokens = split_line(header, delim);
-    // Convert header tokens to lowercase for matching
+    // trim tokens and convert to lowercase for matching
     std::vector<std::string> lowerHeader;
     for (auto& t : headerTokens) {
-        std::string lt = t;
-        std::transform(lt.begin(), lt.end(), lt.begin(), ::tolower);
-        lowerHeader.push_back(lt);
+        std::string trimmed = trim(t);
+        std::transform(trimmed.begin(), trimmed.end(), trimmed.begin(), ::tolower);
+        lowerHeader.push_back(trimmed);
     }
-    // Required columns (case-insensitive)
+    // required columns (case-insensitive)
     int idx_gbifID = -1, idx_species = -1, idx_countryCode = -1, idx_decimalLatitude = -1, idx_decimalLongitude = -1, idx_eventDate = -1;
     for (size_t i = 0; i < lowerHeader.size(); i++) {
         if (lowerHeader[i] == "gbifid")
@@ -409,9 +418,9 @@ std::vector<Record> loadCSV(const std::string &filename) {
         if (tokens.size() < lowerHeader.size())
             continue;
         Record rec;
-        rec.gbifID = tokens[idx_gbifID];
-        rec.species = tokens[idx_species];
-        rec.countryCode = tokens[idx_countryCode];
+        rec.gbifID = trim(tokens[idx_gbifID]);
+        rec.species = trim(tokens[idx_species]);
+        rec.countryCode = trim(tokens[idx_countryCode]);
         try {
             rec.lat = std::stod(tokens[idx_decimalLatitude]);
         } catch(...) {
@@ -422,7 +431,7 @@ std::vector<Record> loadCSV(const std::string &filename) {
         } catch(...) {
             rec.lon = std::numeric_limits<double>::quiet_NaN();
         }
-        rec.eventDate = tokens[idx_eventDate];
+        rec.eventDate = trim(tokens[idx_eventDate]);
         rec.row_id = row_id++;
         records.push_back(rec);
     }
@@ -438,7 +447,7 @@ void segfault_handler(int signum) {
 int main() {
     std::signal(SIGSEGV, segfault_handler);
 
-    // Use CSV because Parquet is corrupt
+    // Use CSV because the Parquet data is corrupt
     std::string csvFile = "/Users/njord888/downloads/0023500-241107131044228.csv";
     std::string centroidsCSV = "/Users/njord888/countryref.csv";
     
@@ -454,7 +463,7 @@ int main() {
     records = cc_gbif(records, 1000.0, true);
     records = reassign_row_ids(records);
     
-    std::ofstream outfile("cleaned_data.csv");
+    std::ofstream outfile("cleaned_data1.2.csv");
     if (!outfile.is_open()) {
         std::cerr << "error: cannot open output file for writing." << std::endl;
         return 1;
