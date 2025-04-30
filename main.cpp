@@ -6,20 +6,18 @@
 #include <cmath>
 #include <fstream>
 #include <filesystem>
-#include <future>
 #include <iostream>
 #include <limits>
 #include <sstream>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 #include <algorithm>
-#include <exception>
 #include <csignal>
 #include <cstdlib>
-#include <system_error>
 
-// Include GDAL/OGR headers.
+// GDAL/OGR headers
 #include "gdal_priv.h"
 #include "ogrsf_frmts.h"
 
@@ -30,43 +28,35 @@ namespace fs = std::filesystem;
 // --------------------
 std::string trim(const std::string &s) {
     size_t start = s.find_first_not_of(" \t\n\r\"");
-    size_t end = s.find_last_not_of(" \t\n\r\"");
+    size_t end   = s.find_last_not_of(" \t\n\r\"");
     if (start == std::string::npos || end == std::string::npos)
         return "";
     return s.substr(start, end - start + 1);
 }
 
 // --------------------
-// Data Structures
+// Data Structure
 // --------------------
 struct Record {
     std::string gbifID;
     std::string species;
     std::string countryCode;
-    double lon;          // decimalLongitude
-    double lat;          // decimalLatitude
+    double      lon;
+    double      lat;
     std::string eventDate;
-    int row_id;
-};
-
-struct RasterCell {
-    int id;
-    double centroid_lon;
-    double centroid_lat;
-    int count;
+    int         row_id;
 };
 
 // --------------------
-// Global Cleaning Summary
+// Cleaning Summary
 // --------------------
 struct CleaningSummary {
     std::string functionName;
-    size_t beforeCount;
-    size_t afterCount;
-    bool skipped;
-    double durationSeconds; // in seconds
+    size_t      beforeCount;
+    size_t      afterCount;
+    bool        skipped;
+    double      durationSeconds;
 };
-
 std::vector<CleaningSummary> cleaningSummaries;
 
 // --------------------
@@ -74,860 +64,551 @@ std::vector<CleaningSummary> cleaningSummaries;
 // --------------------
 std::vector<OGRGeometry*> loadPolygons(const std::string &shapefilePath) {
     std::vector<OGRGeometry*> polygons;
-    GDALDataset *poDS = (GDALDataset*)GDALOpenEx(shapefilePath.c_str(), GDAL_OF_VECTOR, nullptr, nullptr, nullptr);
-    if (poDS == nullptr) {
-        std::cerr << "Failed to open shapefile: " << shapefilePath << std::endl;
+    GDALDataset *ds = (GDALDataset*)GDALOpenEx(
+        shapefilePath.c_str(), GDAL_OF_VECTOR, nullptr, nullptr, nullptr
+    );
+    if (!ds) {
+        std::cerr << "Failed to open shapefile: " << shapefilePath << "\n";
         return polygons;
     }
-    OGRLayer *poLayer = poDS->GetLayer(0);
-    poLayer->ResetReading();
-    OGRFeature *poFeature;
-    while ((poFeature = poLayer->GetNextFeature()) != nullptr) {
-        OGRGeometry *poGeometry = poFeature->GetGeometryRef();
-        if (poGeometry != nullptr) {
-            OGRGeometry *poClone = poGeometry->clone();
-            polygons.push_back(poClone);
-        }
-        OGRFeature::DestroyFeature(poFeature);
+    OGRLayer *layer = ds->GetLayer(0);
+    layer->ResetReading();
+    OGRFeature *feat;
+    while ((feat = layer->GetNextFeature())) {
+        OGRGeometry *geom = feat->GetGeometryRef();
+        if (geom) polygons.push_back(geom->clone());
+        OGRFeature::DestroyFeature(feat);
     }
-    GDALClose(poDS);
+    GDALClose(ds);
     return polygons;
 }
 
 void freePolygons(std::vector<OGRGeometry*> &polygons) {
-    for (auto geom : polygons) {
-        if (geom) {
-            OGRGeometryFactory::destroyGeometry(geom);
-        }
+    for (auto *g : polygons) {
+        OGRGeometryFactory::destroyGeometry(g);
     }
     polygons.clear();
 }
 
 // --------------------
-// Timing Helper Template
+// Load Country Features
+// --------------------
+std::vector<std::pair<OGRGeometry*, std::string>>
+loadCountryFeatures(const std::string &shapefilePath,
+                    const std::string &isoField = "ISO_A3") {
+    std::vector<std::pair<OGRGeometry*, std::string>> feats;
+    GDALDataset *ds = (GDALDataset*)GDALOpenEx(
+        shapefilePath.c_str(), GDAL_OF_VECTOR, nullptr, nullptr, nullptr
+    );
+    if (!ds) {
+        std::cerr << "Failed to open country shapefile: " << shapefilePath << "\n";
+        return feats;
+    }
+    OGRLayer *layer = ds->GetLayer(0);
+    layer->ResetReading();
+    OGRFeature *feat;
+    while ((feat = layer->GetNextFeature())) {
+        OGRGeometry *geom = feat->GetGeometryRef();
+        if (!geom) { OGRFeature::DestroyFeature(feat); continue; }
+        OGRGeometry *clone = geom->clone();
+        const char *iso = feat->GetFieldAsString(isoField.c_str());
+        feats.emplace_back(clone, iso ? iso : "");
+        OGRFeature::DestroyFeature(feat);
+    }
+    GDALClose(ds);
+    return feats;
+}
+
+// --------------------
+// Count ISO Alpha-2 Codes
+// --------------------
+std::unordered_map<std::string,int>
+countIsoA2(const std::vector<Record> &records) {
+    std::unordered_map<std::string,int> counts;
+    for (auto &r : records) {
+        if (r.countryCode.size() == 2) {
+            counts[r.countryCode]++;
+        }
+    }
+    return counts;
+}
+
+// --------------------
+// Timing Helper
 // --------------------
 template<typename F, typename... Args>
 auto measureDuration(F func, Args&&... args)
     -> std::pair<decltype(func(std::forward<Args>(args)...)), double> {
-    auto start = std::chrono::steady_clock::now();
+    auto start  = std::chrono::steady_clock::now();
     auto result = func(std::forward<Args>(args)...);
-    auto end = std::chrono::steady_clock::now();
+    auto end    = std::chrono::steady_clock::now();
     std::chrono::duration<double> elapsed = end - start;
     return {result, elapsed.count()};
 }
 
 // --------------------
-// Spatial and Utility Functions
+// Spatial Utility
 // --------------------
 double haversine(double lon1, double lat1, double lon2, double lat2) {
     const double R = 6371.0;
     double dlon = (lon2 - lon1) * M_PI / 180.0;
     double dlat = (lat2 - lat1) * M_PI / 180.0;
-    double a = sin(dlat / 2) * sin(dlat / 2) +
-               cos(lat1 * M_PI / 180.0) * cos(lat2 * M_PI / 180.0) *
-               sin(dlon / 2) * sin(dlon / 2);
-    double c = 2 * atan2(std::sqrt(a), std::sqrt(1 - a));
+    double a = sin(dlat/2)*sin(dlat/2)
+             + cos(lat1*M_PI/180.0)*cos(lat2*M_PI/180.0)
+               * sin(dlon/2)*sin(dlon/2);
+    double c = 2 * atan2(sqrt(a), sqrt(1 - a));
     return R * c;
 }
 
 std::vector<Record> reassign_row_ids(const std::vector<Record> &records) {
-    std::vector<Record> newRecords = records;
-    for (size_t i = 0; i < newRecords.size(); i++) {
-        newRecords[i].row_id = static_cast<int>(i);
+    std::vector<Record> out = records;
+    for (size_t i = 0; i < out.size(); ++i) {
+        out[i].row_id = static_cast<int>(i);
     }
-    return newRecords;
+    return out;
 }
 
 // --------------------
-// Full Cleaning Functions
+// Cleaning Functions
 // --------------------
 
-// cc_val: Remove records with invalid coordinates.
+// cc_val
 std::vector<Record> cc_val(const std::vector<Record> &records,
-                           const std::string &lonCol = "decimalLongitude",
-                           const std::string &latCol = "decimalLatitude",
-                           const std::string &value = "clean",
                            bool verbose = true) {
     std::vector<Record> valid;
-    for (const auto &rec : records) {
-        bool invalid = false;
-        if (std::isnan(rec.lon) || std::isnan(rec.lat))
-            invalid = true;
-        if (rec.lon < -180.0 || rec.lon > 180.0)
-            invalid = true;
-        if (rec.lat < -90.0 || rec.lat > 90.0)
-            invalid = true;
-        if (!invalid)
-            valid.push_back(rec);
+    for (auto &r : records) {
+        if (std::isnan(r.lon) || std::isnan(r.lat)) continue;
+        if (r.lon < -180 || r.lon > 180)    continue;
+        if (r.lat < -90  || r.lat > 90)     continue;
+        valid.push_back(r);
     }
-    size_t removed = records.size() - valid.size();
-    if (verbose) {
-        if (value == "clean")
-            std::cout << "cc_val: Removed " << removed << " records." << std::endl;
-        else
-            std::cout << "cc_val: Flagged " << removed << " records." << std::endl;
-    }
+    if (verbose)
+        std::cout<<"cc_val: Removed "<<(records.size()-valid.size())
+                 <<" records.\n";
     return valid;
 }
 
-// cc_outl: Remove outlier records for each species based on distance.
-// This version prints progress for each species group processed.
+// cc_zero
+std::vector<Record> cc_zero(const std::vector<Record> &records,
+                            bool verbose = true) {
+    std::vector<Record> out;
+    for (auto &r : records) {
+        if (!(r.lon == 0.0 && r.lat == 0.0))
+            out.push_back(r);
+    }
+    if (verbose)
+        std::cout<<"cc_zero: Removed "<<(records.size()-out.size())
+                 <<" records (zero coords).\n";
+    return out;
+}
+
+// cc_dupl with 10m spatial jitter and eventDate
+std::vector<Record> cc_dupl(const std::vector<Record> &records,
+                            bool verbose = true) {
+    const double jitter_deg = 10.0 / 111320.0; // ~10m in degrees
+    std::unordered_set<std::string> seen;
+    std::vector<Record> out;
+    for (auto &r : records) {
+        int cellX = static_cast<int>(std::floor(r.lon / jitter_deg));
+        int cellY = static_cast<int>(std::floor(r.lat / jitter_deg));
+        std::ostringstream key;
+        key << r.species << "_" << cellX << "_" << cellY
+            << "_" << r.eventDate;
+        std::string ks = key.str();
+        if (seen.insert(ks).second) {
+            out.push_back(r);
+        }
+    }
+    if (verbose)
+        std::cout<<"cc_dupl: Removed "<<(records.size()-out.size())
+                 <<" duplicates (10m jitter + eventDate).\n";
+    return out;
+}
+
+// cc_inst
+std::vector<Record> cc_inst(const std::vector<Record> &records,
+                            const std::vector<std::pair<double,double>> &inst,
+                            double buffer = 1000.0,
+                            bool verbose = true) {
+    double buf_km = buffer / 1000.0;
+    std::vector<Record> out;
+    for (auto &r : records) {
+        bool keep = true;
+        for (auto &i : inst) {
+            if (haversine(r.lon,r.lat,i.first,i.second) <= buf_km) {
+                keep = false; break;
+            }
+        }
+        if (keep) out.push_back(r);
+    }
+    if (verbose)
+        std::cout<<"cc_inst: Removed "<<(records.size()-out.size())
+                 <<" records (institutional).\n";
+    return out;
+}
+
+// cc_coun with first ten flagged debug
+std::vector<Record> cc_coun(const std::vector<Record> &records,
+                            const std::string &shapefilePath,
+                            const std::string &isoField = "ISO_A3",
+                            bool verbose = true) {
+    auto countries = loadCountryFeatures(shapefilePath, isoField);
+    std::vector<Record> out;
+    size_t removed = 0, debugCount = 0;
+    for (auto &r : records) {
+        OGRPoint pt(r.lon, r.lat);
+        bool match = false;
+        for (auto &p : countries) {
+            if (pt.Within(p.first)) {
+                if (p.second == r.countryCode)
+                    match = true;
+                break;
+            }
+        }
+        if (match) {
+            out.push_back(r);
+        } else {
+            if (debugCount < 10) {
+                std::cerr<<"Flagged: "<<r.gbifID
+                         <<" @("<<r.lon<<","<<r.lat<<") "
+                         <<"countryCode="<<r.countryCode<<"\n";
+                ++debugCount;
+            }
+            ++removed;
+        }
+    }
+    if (verbose)
+        std::cout<<"cc_coun: Removed "<<removed
+                 <<" records (country mismatch).\n";
+    for (auto &p : countries)
+        OGRGeometryFactory::destroyGeometry(p.first);
+    return out;
+}
+
+// cc_outl per-species only
 std::vector<Record> cc_outl(const std::vector<Record> &records,
                             const std::string &method = "quantile",
                             double mltpl = 5.0,
                             double tdi = 1000.0,
                             int min_occs = 7,
-                            bool thinning = false,
-                            double thinning_res = 0.5) {
-    std::unordered_map<std::string, std::vector<Record>> speciesMap;
-    for (const auto &rec : records) {
-        speciesMap[rec.species].push_back(rec);
-    }
+                            bool        = false,
+                            double      = 0.0) {
+    std::unordered_map<std::string,std::vector<Record>> speciesMap;
+    for (auto &r : records) speciesMap[r.species].push_back(r);
     std::vector<bool> keep(records.size(), true);
-    int groupCounter = 0;
-    for (const auto &kv : speciesMap) {
-        groupCounter++;
-        const auto &group = kv.second;
-        if (group.size() < static_cast<size_t>(min_occs)) {
-            std::cerr << "warning: species " << kv.first << " has fewer than " << min_occs << " records. Skipping outlier test for this species." << std::endl;
+    size_t idx = 0;
+    for (auto &kv : speciesMap) {
+        ++idx;
+        auto &grp = kv.second;
+        if (grp.size() < (size_t)min_occs) {
+            std::cerr<<"warning: species "<<kv.first
+                     <<" <"<<min_occs<<"; skipping\n";
             continue;
         }
-        size_t n = group.size();
-        std::vector<double> values(n, 0.0);
-        bool raster_flag = (group.size() >= 10000) || thinning;
-        if (raster_flag) {
-            std::vector<double> minDistances(n, std::numeric_limits<double>::max());
-            for (size_t i = 0; i < n; i++) {
-                for (size_t j = 0; j < n; j++) {
-                    if (i == j) continue;
-                    double d = haversine(group[i].lon, group[i].lat,
-                                         group[j].lon, group[j].lat);
-                    if (d < minDistances[i])
-                        minDistances[i] = d;
-                }
+        size_t n = grp.size();
+        std::vector<double> vals(n, 0.0);
+        for (size_t i=0;i<n;i++) {
+            double minD = std::numeric_limits<double>::infinity();
+            for (size_t j=0;j<n;j++) {
+                if (i==j) continue;
+                double d = haversine(grp[i].lon,grp[i].lat,
+                                     grp[j].lon,grp[j].lat);
+                if (d<minD) minD = d;
             }
-            values = minDistances;
-        } else {
-            if (method == "distance") {
-                std::vector<double> minDistances(n, std::numeric_limits<double>::max());
-                for (size_t i = 0; i < n; i++) {
-                    for (size_t j = 0; j < n; j++) {
-                        if (i == j) continue;
-                        double d = haversine(group[i].lon, group[i].lat,
-                                             group[j].lon, group[j].lat);
-                        if (d < minDistances[i])
-                            minDistances[i] = d;
-                    }
-                }
-                values = minDistances;
-            } else {
-                std::vector<double> meanDistances(n, 0.0);
-                for (size_t i = 0; i < n; i++) {
-                    double sum = 0.0;
-                    int count = 0;
-                    for (size_t j = 0; j < n; j++) {
-                        if (i == j) continue;
-                        double d = haversine(group[i].lon, group[i].lat,
-                                             group[j].lon, group[j].lat);
-                        sum += d;
-                        count++;
-                    }
-                    meanDistances[i] = (count > 0 ? sum / count : 0.0);
-                }
-                values = meanDistances;
-            }
+            vals[i] = minD;
         }
-        if (method == "distance") {
-            for (size_t i = 0; i < n; i++) {
-                if (values[i] > tdi)
-                    keep[group[i].row_id] = false;
-            }
-        } else if (method == "quantile") {
-            std::vector<double> sorted = values;
-            std::sort(sorted.begin(), sorted.end());
-            double q1 = sorted[sorted.size() / 4];
-            double q3 = sorted[(3 * sorted.size()) / 4];
-            double iqr = q3 - q1;
-            double threshold = q3 + mltpl * iqr;
-            for (size_t i = 0; i < n; i++) {
-                if (values[i] > threshold)
-                    keep[group[i].row_id] = false;
-            }
-        } else if (method == "mad") {
-            std::vector<double> sorted = values;
-            std::sort(sorted.begin(), sorted.end());
-            double median = sorted[sorted.size() / 2];
-            std::vector<double> absDev;
-            for (double v : values) {
-                absDev.push_back(std::abs(v - median));
-            }
-            std::sort(absDev.begin(), absDev.end());
-            double mad = absDev[absDev.size() / 2];
-            double threshold = median + mltpl * mad;
-            for (size_t i = 0; i < n; i++) {
-                if (values[i] > threshold)
-                    keep[group[i].row_id] = false;
-            }
+        std::vector<double> sorted = vals;
+        std::sort(sorted.begin(), sorted.end());
+        double q1 = sorted[n/4], q3 = sorted[(3*n)/4], iqr = q3 - q1;
+        double thr = q3 + mltpl*iqr;
+        for (size_t i=0;i<n;i++) {
+            if (vals[i] > thr)
+                keep[grp[i].row_id] = false;
         }
-        std::cout << "Processed species group \"" << kv.first << "\" (" << group.size() << " records)" << std::endl;
+        std::cout<<"Processed outlier "<<idx<<"/"<<speciesMap.size()
+                 <<"\r"<<std::flush;
     }
-    std::vector<Record> result;
-    for (size_t i = 0; i < records.size(); i++) {
-        if (keep[i])
-            result.push_back(records[i]);
-    }
-    std::cout << "cc_outl: removed " << (records.size() - result.size()) << " records." << std::endl;
-    return result;
+    std::vector<Record> out;
+    for (size_t i=0;i<records.size();i++)
+        if (keep[i]) out.push_back(records[i]);
+    std::cout<<"\ncc_outl: Removed "<<(records.size()-out.size())
+             <<" records.\n";
+    return out;
 }
 
-/*
- * cc_cen: Removes records too close to specified centroids.
- */
-std::vector<Record> cc_cen(const std::vector<Record> &records,
-                           const std::vector<std::pair<double, double>> &centroids,
-                           double buffer = 1000.0) {
-    double buffer_km = buffer / 1000.0;
-    std::vector<bool> keep(records.size(), true);
-    for (size_t i = 0; i < records.size(); i++) {
-        for (const auto &cen : centroids) {
-            double d = haversine(records[i].lon, records[i].lat, cen.first, cen.second);
-            if (d <= buffer_km) {
-                keep[i] = false;
-                break;
+// cc_cap
+std::vector<Record> cc_cap(const std::vector<Record> &records,
+                           const std::vector<std::pair<double,double>> &caps,
+                           double buffer = 10000.0,
+                           bool verbose = true) {
+    double buf_km = buffer / 1000.0;
+    std::vector<Record> out;
+    for (auto &r : records) {
+        bool keep = true;
+        for (auto &c : caps) {
+            if (haversine(r.lon,r.lat,c.first,c.second) <= buf_km) {
+                keep = false; break;
             }
         }
+        if (keep) out.push_back(r);
     }
-    std::vector<Record> result;
-    for (size_t i = 0; i < records.size(); i++) {
-        if (keep[i])
-            result.push_back(records[i]);
-    }
-    std::cout << "cc_cen: removed " << (records.size() - result.size()) << " records." << std::endl;
-    return result;
+    if (verbose)
+        std::cout<<"cc_cap: Removed "<<(records.size()-out.size())
+                 <<" records.\n";
+    return out;
 }
 
-/*
- * cc_gbif: Removes records near the GBIF headquarters (12.58, 55.67).
- */
+// cc_gbif
 std::vector<Record> cc_gbif(const std::vector<Record> &records,
                             double buffer = 1000.0,
-                            bool geod = true) {
-    double gbif_lon = 12.58;
-    double gbif_lat = 55.67;
-    double buffer_km = buffer / 1000.0;
-    std::vector<bool> keep(records.size(), true);
-    for (size_t i = 0; i < records.size(); i++) {
-        double d = haversine(records[i].lon, records[i].lat, gbif_lon, gbif_lat);
-        if (d <= buffer_km)
-            keep[i] = false;
-    }
-    std::vector<Record> result;
-    for (size_t i = 0; i < records.size(); i++) {
-        if (keep[i])
-            result.push_back(records[i]);
-    }
-    std::cout << "cc_gbif: removed " << (records.size() - result.size()) << " records." << std::endl;
-    return result;
-}
-
-/*
- * cc_cap: Removes records that are within a buffer (in meters) of any given capital coordinates.
- */
-std::vector<Record> cc_cap(const std::vector<Record> &records,
-                           const std::vector<std::pair<double, double>> &capitals,
-                           double buffer = 10000,
-                           bool geod = true,
-                           bool verify = false,
-                           const std::string &value = "clean",
-                           bool verbose = true) {
-    double buffer_km = buffer / 1000.0;
-    std::vector<bool> keep(records.size(), true);
-    for (size_t i = 0; i < records.size(); i++) {
-        for (const auto &cap : capitals) {
-            double d = haversine(records[i].lon, records[i].lat, cap.first, cap.second);
-            if (d <= buffer_km) {
-                keep[i] = false;
-                break;
-            }
-        }
-    }
-    if (verbose) {
-        std::cout << "cc_cap: removed " 
-                  << (records.size() - std::count(keep.begin(), keep.end(), true))
-                  << " records." << std::endl;
-    }
-    std::vector<Record> result;
-    for (size_t i = 0; i < records.size(); i++) {
-        if (keep[i])
-            result.push_back(records[i]);
-    }
-    return result;
-}
-
-/*
- * cc_coun: Removes records where the reported country code does not match the country determined by coordinates.
- * (Heuristic: if latitude > 0 assume "USA", otherwise "RUS".)
- */
-std::vector<Record> cc_coun(const std::vector<Record> &records,
-                            const std::string &value = "clean",
                             bool verbose = true) {
-    std::vector<bool> keep(records.size(), true);
-    for (size_t i = 0; i < records.size(); i++) {
-        std::string ref_code = (records[i].lat > 0 ? "USA" : "RUS");
-        if (ref_code != records[i].countryCode)
-            keep[i] = false;
+    double buf_km = buffer / 1000.0;
+    double glon = 12.58, glat = 55.67;
+    std::vector<Record> out;
+    for (auto &r : records) {
+        if (haversine(r.lon,r.lat,glon,glat) > buf_km)
+            out.push_back(r);
     }
-    if (verbose) {
-        std::cout << "cc_coun: removed " 
-                  << (records.size() - std::count(keep.begin(), keep.end(), true))
-                  << " records." << std::endl;
-    }
-    std::vector<Record> result;
-    for (size_t i = 0; i < records.size(); i++) {
-        if (keep[i])
-            result.push_back(records[i]);
-    }
-    return result;
+    if (verbose)
+        std::cout<<"cc_gbif: Removed "<<(records.size()-out.size())
+                 <<" records.\n";
+    return out;
 }
 
-/*
- * cc_dupl: Removes duplicate records based on species and coordinates.
- */
-std::vector<Record> cc_dupl(const std::vector<Record> &records,
-                            const std::string &value = "clean",
-                            bool verbose = true) {
-    std::unordered_map<std::string, bool> seen;
-    std::vector<bool> keep(records.size(), true);
-    for (size_t i = 0; i < records.size(); i++) {
-        std::ostringstream key;
-        key << records[i].species << "_" << records[i].lon << "_" << records[i].lat;
-        std::string keyStr = key.str();
-        if (seen.find(keyStr) != seen.end())
-            keep[i] = false;
-        else
-            seen[keyStr] = true;
-    }
-    if (verbose) {
-        std::cout << "cc_dupl: removed " 
-                  << (records.size() - std::count(keep.begin(), keep.end(), true))
-                  << " duplicate records." << std::endl;
-    }
-    std::vector<Record> result;
-    for (size_t i = 0; i < records.size(); i++) {
-        if (keep[i])
-            result.push_back(records[i]);
-    }
-    return result;
-}
-
-/*
- * cc_equ: Removes records with identical latitude and longitude.
- * "absolute" compares absolute values; "identical" compares the actual values.
- */
-std::vector<Record> cc_equ(const std::vector<Record> &records,
-                           const std::string &test = "absolute",
-                           const std::string &value = "clean",
-                           bool verbose = true) {
-    std::vector<bool> keep(records.size(), true);
-    for (size_t i = 0; i < records.size(); i++) {
-        if (test == "absolute") {
-            if (std::abs(records[i].lon) == std::abs(records[i].lat))
-                keep[i] = false;
-        } else if (test == "identical") {
-            if (records[i].lon == records[i].lat)
-                keep[i] = false;
-        }
-    }
-    if (verbose) {
-        std::cout << "cc_equ: removed " 
-                  << (records.size() - std::count(keep.begin(), keep.end(), true))
-                  << " records with equal lat/lon." << std::endl;
-    }
-    std::vector<Record> result;
-    for (size_t i = 0; i < records.size(); i++) {
-        if (keep[i])
-            result.push_back(records[i]);
-    }
-    return result;
-}
-
-/*
- * cc_inst: Removes records that fall within a buffer of institutional coordinates.
- */
-std::vector<Record> cc_inst(const std::vector<Record> &records,
-                            const std::vector<std::pair<double, double>> &instCoords,
-                            double buffer = 1000.0,
-                            bool verbose = true) {
-    double buffer_km = buffer / 1000.0;
-    std::vector<bool> keep(records.size(), true);
-    for (size_t i = 0; i < records.size(); i++) {
-        for (const auto &inst : instCoords) {
-            double d = haversine(records[i].lon, records[i].lat, inst.first, inst.second);
-            if (d <= buffer_km) {
-                keep[i] = false;
-                break;
-            }
-        }
-    }
-    if (verbose) {
-        std::cout << "cc_inst: removed " 
-                  << (records.size() - std::count(keep.begin(), keep.end(), true))
-                  << " records (institutional coordinates)." << std::endl;
-    }
-    std::vector<Record> result;
-    for (size_t i = 0; i < records.size(); i++) {
-        if (keep[i])
-            result.push_back(records[i]);
-    }
-    return result;
-}
-
-/*
- * cc_zero: Removes records where both longitude and latitude are exactly zero.
- */
-std::vector<Record> cc_zero(const std::vector<Record> &records,
-                           bool verbose = true) {
-    std::vector<bool> keep(records.size(), true);
-    for (size_t i = 0; i < records.size(); i++) {
-        if (records[i].lon == 0.0 && records[i].lat == 0.0)
-            keep[i] = false;
-    }
-    if (verbose) {
-        std::cout << "cc_zero: removed " 
-                  << (records.size() - std::count(keep.begin(), keep.end(), true))
-                  << " records (zero coordinates)." << std::endl;
-    }
-    std::vector<Record> result;
-    for (size_t i = 0; i < records.size(); i++) {
-        if (keep[i])
-            result.push_back(records[i]);
-    }
-    return result;
-}
-
-// --------------------
-// New Functions using GDAL/OGR for Spatial Tests
-// --------------------
-
-/*
- * cc_sea_gdal: Removes records that are non-terrestrial (not on land)
- * by checking points against a land shapefile.
- */
+// cc_sea_gdal
 std::vector<Record> cc_sea_gdal(const std::vector<Record> &records,
-                                const std::string &shapefilePath,
-                                bool verbose = true,
-                                bool *skipped = nullptr) {
-    if (verbose) {
-        std::cout << "Testing sea coordinates using GDAL (land reference)" << std::endl;
-    }
-    std::vector<OGRGeometry*> landPolygons = loadPolygons(shapefilePath);
-    if (landPolygons.empty()) {
-        std::cerr << "No land polygons loaded in cc_sea_gdal. Skipping sea test." << std::endl;
-        if (skipped) *skipped = true;
-        return records;
-    }
-    std::vector<bool> keep(records.size(), true);
-    for (size_t i = 0; i < records.size(); i++) {
-        OGRPoint pt(records[i].lon, records[i].lat);
+                                const std::string &shp,
+                                bool verbose = true) {
+    if (verbose) std::cout<<"cc_sea_gdal: land test\n";
+    auto land = loadPolygons(shp);
+    if (land.empty()) { std::cerr<<"no land loaded\n"; return records; }
+    std::vector<Record> out;
+    for (auto &r : records) {
+        OGRPoint pt(r.lon,r.lat);
         bool onLand = false;
-        for (auto poly : landPolygons) {
-            if (pt.Within(poly)) {
-                onLand = true;
-                break;
-            }
+        for (auto *g : land) {
+            if (pt.Within(g)) { onLand = true; break; }
         }
-        if (!onLand)
-            keep[i] = false;
+        if (onLand) out.push_back(r);
     }
-    if (verbose) {
-        std::cout << "cc_sea_gdal: removed " 
-                  << (records.size() - std::count(keep.begin(), keep.end(), true))
-                  << " records (non-terrestrial)." << std::endl;
-    }
-    std::vector<Record> result;
-    for (size_t i = 0; i < records.size(); i++) {
-        if (keep[i])
-            result.push_back(records[i]);
-    }
-    freePolygons(landPolygons);
-    return result;
+    if (verbose)
+        std::cout<<"cc_sea_gdal: Removed "<<(records.size()-out.size())
+                 <<" records.\n";
+    for (auto *g : land) OGRGeometryFactory::destroyGeometry(g);
+    return out;
 }
 
-/*
- * cc_sea_buffland: Alternative approach using a buffered coastline reference.
- * Loads a coastline shapefile and buffers each geometry by 1 degree,
- * then removes records that fall outside any buffered polygon.
- */
+// cc_sea_buffland
 std::vector<Record> cc_sea_buffland(const std::vector<Record> &records,
-                                    const std::string &coastlineShapefilePath,
-                                    bool verbose = true,
-                                    bool *skipped = nullptr) {
-    if (verbose) {
-        std::cout << "Testing sea coordinates using GDAL (buffered coastline)" << std::endl;
-    }
-    std::vector<OGRGeometry*> originalPolygons = loadPolygons(coastlineShapefilePath);
-    if (originalPolygons.empty()) {
-        std::cerr << "No coastline polygons loaded in cc_sea_buffland. Skipping buffered sea test." << std::endl;
-        if (skipped) *skipped = true;
-        return records;
-    }
-    // Buffer each polygon by 1 degree.
-    std::vector<OGRGeometry*> bufferedPolygons;
-    for (auto geom : originalPolygons) {
-        OGRGeometry *buff = geom->Buffer(1.0);
-        if (buff)
-            bufferedPolygons.push_back(buff);
-    }
-    freePolygons(originalPolygons);
-    std::vector<bool> keep(records.size(), true);
-    for (size_t i = 0; i < records.size(); i++) {
-        OGRPoint pt(records[i].lon, records[i].lat);
+                                    const std::string &shp,
+                                    bool verbose = true) {
+    if (verbose) std::cout<<"cc_sea_buffland: buffered test\n";
+    auto coast = loadPolygons(shp);
+    if (coast.empty()) { std::cerr<<"no coast loaded\n"; return records; }
+    std::vector<OGRGeometry*> buf;
+    for (auto *g : coast) buf.push_back(g->Buffer(1.0));
+    for (auto *g : coast) OGRGeometryFactory::destroyGeometry(g);
+    std::vector<Record> out;
+    for (auto &r : records) {
+        OGRPoint pt(r.lon,r.lat);
         bool onLand = false;
-        for (auto poly : bufferedPolygons) {
-            if (pt.Within(poly)) {
-                onLand = true;
-                break;
-            }
+        for (auto *g : buf) {
+            if (pt.Within(g)) { onLand = true; break; }
         }
-        if (!onLand)
-            keep[i] = false;
+        if (onLand) out.push_back(r);
     }
-    if (verbose) {
-        std::cout << "cc_sea_buffland: removed " 
-                  << (records.size() - std::count(keep.begin(), keep.end(), true))
-                  << " records (outside buffered coastline)." << std::endl;
-    }
-    std::vector<Record> result;
-    for (size_t i = 0; i < records.size(); i++) {
-        if (keep[i])
-            result.push_back(records[i]);
-    }
-    freePolygons(bufferedPolygons);
-    return result;
+    if (verbose)
+        std::cout<<"cc_sea_buffland: Removed "<<(records.size()-out.size())
+                 <<" records.\n";
+    for (auto *g : buf) OGRGeometryFactory::destroyGeometry(g);
+    return out;
 }
 
-/*
- * cc_urb_gdal: Removes records that fall inside urban areas by checking points
- * against an urban areas shapefile.
- */
+// cc_urb_gdal
 std::vector<Record> cc_urb_gdal(const std::vector<Record> &records,
-                                const std::string &shapefilePath,
-                                bool verbose = true,
-                                bool *skipped = nullptr) {
-    if (verbose) {
-        std::cout << "Testing urban areas using GDAL" << std::endl;
-    }
-    std::vector<OGRGeometry*> urbanPolygons = loadPolygons(shapefilePath);
-    if (urbanPolygons.empty()) {
-        std::cerr << "No urban polygons loaded in cc_urb_gdal. Skipping urban test." << std::endl;
-        if (skipped) *skipped = true;
-        return records;
-    }
-    std::vector<bool> keep(records.size(), true);
-    for (size_t i = 0; i < records.size(); i++) {
-        OGRPoint pt(records[i].lon, records[i].lat);
-        for (auto poly : urbanPolygons) {
-            if (pt.Within(poly)) {
-                keep[i] = false;
-                break;
-            }
+                                const std::string &shp,
+                                bool verbose = true) {
+    if (verbose) std::cout<<"cc_urb_gdal: urban test\n";
+    auto urb = loadPolygons(shp);
+    if (urb.empty()) { std::cerr<<"no urban loaded\n"; return records; }
+    std::vector<Record> out;
+    for (auto &r : records) {
+        OGRPoint pt(r.lon,r.lat);
+        bool inU = false;
+        for (auto *g : urb) {
+            if (pt.Within(g)) { inU = true; break; }
         }
+        if (!inU) out.push_back(r);
     }
-    if (verbose) {
-        std::cout << "cc_urb_gdal: removed " 
-                  << (records.size() - std::count(keep.begin(), keep.end(), true))
-                  << " records (urban areas)." << std::endl;
-    }
-    std::vector<Record> result;
-    for (size_t i = 0; i < records.size(); i++) {
-        if (keep[i])
-            result.push_back(records[i]);
-    }
-    freePolygons(urbanPolygons);
-    return result;
+    if (verbose)
+        std::cout<<"cc_urb_gdal: Removed "<<(records.size()-out.size())
+                 <<" records.\n";
+    for (auto *g : urb) OGRGeometryFactory::destroyGeometry(g);
+    return out;
 }
 
 // --------------------
-// CSV Loading and Utility Functions
+// CSV Loading
 // --------------------
-std::vector<std::string> split_line(const std::string &line, char delim) {
-    std::vector<std::string> tokens;
-    std::stringstream ss(line);
-    std::string token;
-    while (std::getline(ss, token, delim)) {
-        tokens.push_back(token);
-    }
-    return tokens;
+std::vector<std::string> split_line(const std::string &line, char d) {
+    std::vector<std::string> tok; std::stringstream ss(line); std::string t;
+    while (std::getline(ss,t,d)) tok.push_back(t);
+    return tok;
 }
-
-std::vector<Record> loadCSV(const std::string &filename) {
-    std::vector<Record> records;
-    std::ifstream file(filename);
-    if (!file.is_open()) {
-        std::cerr << "error: cannot open csv file " << filename << std::endl;
-        return records;
+std::vector<Record> loadCSV(const std::string &fn) {
+    std::ifstream f(fn);
+    if(!f.is_open()){ std::cerr<<"Cannot open "<<fn<<"\n"; return{}; }
+    std::string hdr; std::getline(f,hdr);
+    char d = hdr.find('\t')!=std::string::npos?'\t':',';
+    auto cols = split_line(hdr,d);
+    std::vector<std::string> lh;
+    for(auto &c:cols){
+        auto t=trim(c);
+        std::transform(t.begin(),t.end(),t.begin(),::tolower);
+        lh.push_back(t);
     }
-    std::string header;
-    if (!std::getline(file, header)) {
-        std::cerr << "error: csv file " << filename << " is empty." << std::endl;
-        return records;
+    int ig=-1,is=-1,ic=-1,ilat=-1,ilon=-1,ie=-1;
+    for(int i=0;i<(int)lh.size();++i){
+        if(lh[i]=="gbifid")         ig=i;
+        else if(lh[i]=="species")   is=i;
+        else if(lh[i]=="countrycode")ic=i;
+        else if(lh[i]=="decimallatitude") ilat=i;
+        else if(lh[i]=="decimallongitude")ilon=i;
+        else if(lh[i]=="eventdate") ie=i;
     }
-    char delim = (header.find('\t') != std::string::npos) ? '\t' : ',';
-    std::vector<std::string> headerTokens = split_line(header, delim);
-    std::vector<std::string> lowerHeader;
-    for (auto &t : headerTokens) {
-        std::string trimmed = trim(t);
-        std::transform(trimmed.begin(), trimmed.end(), trimmed.begin(), ::tolower);
-        lowerHeader.push_back(trimmed);
+    if(ig<0||is<0||ic<0||ilat<0||ilon<0||ie<0){
+        std::cerr<<"Missing column\n";return{};
     }
-    int idx_gbifID = -1, idx_species = -1, idx_countryCode = -1;
-    int idx_decimalLatitude = -1, idx_decimalLongitude = -1, idx_eventDate = -1;
-    for (size_t i = 0; i < lowerHeader.size(); i++) {
-        if (lowerHeader[i] == "gbifid")
-            idx_gbifID = static_cast<int>(i);
-        else if (lowerHeader[i] == "species")
-            idx_species = static_cast<int>(i);
-        else if (lowerHeader[i] == "countrycode")
-            idx_countryCode = static_cast<int>(i);
-        else if (lowerHeader[i] == "decimallatitude")
-            idx_decimalLatitude = static_cast<int>(i);
-        else if (lowerHeader[i] == "decimallongitude")
-            idx_decimalLongitude = static_cast<int>(i);
-        else if (lowerHeader[i] == "eventdate")
-            idx_eventDate = static_cast<int>(i);
+    std::vector<Record> recs; int rid=0;
+    std::string ln;
+    while(std::getline(f,ln)){
+        auto t=split_line(ln,d);
+        if((int)t.size() < (int)lh.size()) continue;
+        Record r;
+        r.gbifID      = trim(t[ig]);
+        r.species     = trim(t[is]);
+        r.countryCode = trim(t[ic]);
+        try{ r.lat = std::stod(t[ilat]); } catch(...){ r.lat = NAN; }
+        try{ r.lon = std::stod(t[ilon]); } catch(...){ r.lon = NAN; }
+        r.eventDate = trim(t[ie]);
+        r.row_id    = rid++;
+        recs.push_back(r);
     }
-    if (idx_gbifID == -1 || idx_species == -1 || idx_countryCode == -1 ||
-        idx_decimalLatitude == -1 || idx_decimalLongitude == -1 || idx_eventDate == -1) {
-        std::cerr << "error: one or more required columns are missing in the CSV header." << std::endl;
-        return records;
-    }
-    int row_id = 0;
-    std::string line;
-    while (std::getline(file, line)) {
-        std::vector<std::string> tokens = split_line(line, delim);
-        if (tokens.size() < lowerHeader.size())
-            continue;
-        Record rec;
-        rec.gbifID = trim(tokens[idx_gbifID]);
-        rec.species = trim(tokens[idx_species]);
-        rec.countryCode = trim(tokens[idx_countryCode]);
-        try {
-            rec.lat = std::stod(tokens[idx_decimalLatitude]);
-        } catch (...) {
-            rec.lat = std::numeric_limits<double>::quiet_NaN();
-        }
-        try {
-            rec.lon = std::stod(tokens[idx_decimalLongitude]);
-        } catch (...) {
-            rec.lon = std::numeric_limits<double>::quiet_NaN();
-        }
-        rec.eventDate = trim(tokens[idx_eventDate]);
-        rec.row_id = row_id++;
-        records.push_back(rec);
-    }
-    std::cout << "loaded " << records.size() << " records from csv." << std::endl;
-    return records;
-}
-
-std::vector<std::pair<double, double>> loadCentroidsCSV(const std::string &filename) {
-    std::vector<std::pair<double, double>> centroids;
-    std::ifstream file(filename);
-    if (!file.is_open()) {
-        std::cerr << "error: cannot open centroids csv file " << filename << std::endl;
-        return centroids;
-    }
-    std::string headerLine;
-    if (!std::getline(file, headerLine)) {
-        std::cerr << "error: empty centroids file or missing header." << std::endl;
-        return centroids;
-    }
-    std::vector<std::string> headerTokens;
-    std::stringstream headerStream(headerLine);
-    std::string token;
-    while (std::getline(headerStream, token, ',')) {
-        headerTokens.push_back(trim(token));
-    }
-    int lonIndex = -1, latIndex = -1;
-    for (size_t i = 0; i < headerTokens.size(); i++) {
-        std::string lowerToken = headerTokens[i];
-        std::transform(lowerToken.begin(), lowerToken.end(), lowerToken.begin(), ::tolower);
-        if (lowerToken == "centroid.lon")
-            lonIndex = static_cast<int>(i);
-        else if (lowerToken == "centroid.lat")
-            latIndex = static_cast<int>(i);
-    }
-    if (lonIndex == -1 || latIndex == -1) {
-        std::cerr << "error: header does not contain required columns 'centroid.lon' and 'centroid.lat'" << std::endl;
-        return centroids;
-    }
-    std::string line;
-    while (std::getline(file, line)) {
-        std::stringstream ss(line);
-        std::vector<std::string> tokens;
-        while (std::getline(ss, token, ',')) {
-            tokens.push_back(trim(token));
-        }
-        if (tokens.size() <= static_cast<size_t>(std::max(lonIndex, latIndex)))
-            continue;
-        double lonVal = std::numeric_limits<double>::quiet_NaN();
-        double latVal = std::numeric_limits<double>::quiet_NaN();
-        try {
-            lonVal = std::stod(tokens[lonIndex]);
-        } catch (...) {}
-        try {
-            latVal = std::stod(tokens[latIndex]);
-        } catch (...) {}
-        if (!std::isnan(lonVal) && !std::isnan(latVal))
-            centroids.push_back(std::make_pair(lonVal, latVal));
-    }
-    std::cout << "loaded " << centroids.size() << " centroids from " << filename << std::endl;
-    return centroids;
-}
-
-void segfault_handler(int signum) {
-    std::cerr << "segmentation fault (signal " << signum << ") occurred." << std::endl;
-    std::exit(signum);
+    std::cout<<"loaded "<<recs.size()<<" records from csv.\n";
+    return recs;
 }
 
 // --------------------
-// Main Function
+// Segfault Handler
+// --------------------
+void segfault_handler(int sig) {
+    std::cerr<<"Segfault (signal "<<sig<<")\n";
+    std::exit(sig);
+}
+
+// --------------------
+// main()
 // --------------------
 int main() {
     std::signal(SIGSEGV, segfault_handler);
-
     GDALAllRegister();
 
-    auto overallStart = std::chrono::steady_clock::now();
+    auto t0 = std::chrono::steady_clock::now();
 
-    // File paths for CSV data and centroids.
-    std::string csvFile = "downloads/0023500-241107131044228.csv";
-    std::string centroidsCSV = "countryref.csv";
+    std::string csvFile    = "/Users/njord888/downloads/0023500-241107131044228.csv";
+    std::string landShp    = "/Users/njord888/Downloads/ne_10m_land/ne_10m_land.shp";
+    std::string coastShp   = "/Users/njord888/Downloads/ne_10m_coastline/ne_10m_coastline.shp";
+    std::string urbShp     = "/Users/njord888/Downloads/ne_10m_urban_areas/ne_10m_urban_areas.shp";
+    std::string countryShp = "/Users/njord888/Downloads/ne_110m_admin_0_countries/"
+                             "ne_110m_admin_0_countries.shp";
 
-    // Shapefile paths for spatial tests.
-    std::string landShapefile = "Downloads/ne_10m_land/ne_10m_land.shp";
-    std::string coastlineShapefile = "Downloads/ne_10m_coastline/ne_10m_coastline.shp";
-    std::string urbanShapefile = "Downloads/ne_10m_urban_areas/ne_10m_urban_areas.shp";
+    auto records = loadCSV(csvFile);
+    size_t initial = records.size();
 
-    size_t initialCount = 0;
-    std::vector<Record> records = loadCSV(csvFile);
-    initialCount = records.size();
-
-    // --- Cleaning Steps with Duration Timing ---
-    {
-        auto [res, dur] = measureDuration(cc_val, records, "decimalLongitude", "decimalLatitude", "clean", true);
-        records = res;
-        cleaningSummaries.push_back({"cc_val", initialCount, records.size(), false, dur});
-        records = reassign_row_ids(records);
-    }
-    {
-        size_t before = records.size();
-        auto [res, dur] = measureDuration(cc_zero, records, true);
-        records = res;
-        cleaningSummaries.push_back({"cc_zero", before, records.size(), false, dur});
-        records = reassign_row_ids(records);
-    }
-    {
-        size_t before = records.size();
-        auto [res, dur] = measureDuration(cc_dupl, records, "clean", true);
-        records = res;
-        cleaningSummaries.push_back({"cc_dupl", before, records.size(), false, dur});
-        records = reassign_row_ids(records);
-    }
-    {
-        size_t before = records.size();
-        auto [res, dur] = measureDuration(cc_inst, records, std::vector<std::pair<double, double>>{{-77.0365, 38.8977}, {-0.1278, 51.5074}}, 1000.0, true);
-        records = res;
-        cleaningSummaries.push_back({"cc_inst", before, records.size(), false, dur});
-        records = reassign_row_ids(records);
-    }
-    {
-        size_t before = records.size();
-        auto [res, dur] = measureDuration(cc_coun, records, "clean", true);
-        records = res;
-        cleaningSummaries.push_back({"cc_coun", before, records.size(), false, dur});
-        records = reassign_row_ids(records);
-    }
-    {
-        size_t before = records.size();
-        // Run simpler functions first, then outlier (cc_outl) as a heavy step.
-        auto [res, dur] = measureDuration(cc_outl, records, "quantile", 5.0, 1000.0, 7, false, 0.5);
-        records = res;
-        cleaningSummaries.push_back({"cc_outl", before, records.size(), false, dur});
-        records = reassign_row_ids(records);
-    }
-    {
-        size_t before = records.size();
-        std::vector<std::pair<double, double>> capitals = { {-77.0369, 38.9072}, {2.3522, 48.8566} };
-        auto [res, dur] = measureDuration(cc_cap, records, capitals, 10000, true, false, "clean", true);
-        records = res;
-        cleaningSummaries.push_back({"cc_cap", before, records.size(), false, dur});
-        records = reassign_row_ids(records);
-    }
-    {
-        size_t before = records.size();
-        auto [res, dur] = measureDuration(cc_gbif, records, 1000.0, true);
-        records = res;
-        cleaningSummaries.push_back({"cc_gbif", before, records.size(), false, dur});
-        records = reassign_row_ids(records);
-    }
-    {
-        size_t before = records.size();
-        // cc_sea_gdal using land shapefile.
-        bool skippedSea = false;
-        auto [res, dur] = measureDuration(cc_sea_gdal, records, landShapefile, true, &skippedSea);
-        records = res;
-        cleaningSummaries.push_back({"cc_sea_gdal", before, records.size(), skippedSea, dur});
-        records = reassign_row_ids(records);
-    }
-    {
-        size_t before = records.size();
-        // cc_sea_buffland using coastline shapefile.
-        bool skippedBuff = false;
-        auto [res, dur] = measureDuration(cc_sea_buffland, records, coastlineShapefile, true, &skippedBuff);
-        records = res;
-        cleaningSummaries.push_back({"cc_sea_buffland", before, records.size(), skippedBuff, dur});
-        records = reassign_row_ids(records);
-    }
-    {
-        size_t before = records.size();
-        // cc_urb_gdal using urban areas shapefile.
-        bool skippedUrb = false;
-        auto [res, dur] = measureDuration(cc_urb_gdal, records, urbanShapefile, true, &skippedUrb);
-        records = res;
-        cleaningSummaries.push_back({"cc_urb_gdal", before, records.size(), skippedUrb, dur});
-        records = reassign_row_ids(records);
+    // Count ISO Alpha-2 codes before cleaning
+    auto isoA2Counts = countIsoA2(records);
+    std::cout<<"ISO Alpha-2 countryCode counts:\n";
+    for (auto &kv : isoA2Counts) {
+        std::cout<<"  "<<kv.first<<": "<<kv.second<<"\n";
     }
 
-    auto overallEnd = std::chrono::steady_clock::now();
-    std::chrono::duration<double> overallDur = overallEnd - overallStart;
-
-    std::cout << "\n--- Cleaning Summary ---\n";
-    for (const auto &summary : cleaningSummaries) {
-        std::cout << summary.functionName << ": "
-                  << summary.beforeCount << " records before, "
-                  << summary.afterCount << " records after, "
-                  << (summary.beforeCount - summary.afterCount) << " removed, took "
-                  << summary.durationSeconds << " seconds";
-        if (summary.skipped)
-            std::cout << " (SKIPPED)";
-        std::cout << std::endl;
+    {
+        auto [r,d] = measureDuration(cc_val, records, true);
+        cleaningSummaries.push_back({"cc_val", initial, r.size(), false, d});
+        records = reassign_row_ids(r);
     }
-    std::cout << "Overall: " << initialCount << " records at start, " << records.size()
-              << " records after cleaning.\n";
-    std::cout << "Total cleaning time: " << overallDur.count() << " seconds" << std::endl;
-
-    std::ofstream outfile("cleaned_data1.4.csv");
-    if (!outfile.is_open()) {
-        std::cerr << "error: cannot open output file for writing." << std::endl;
-        return 1;
+    {
+        auto [r,d] = measureDuration(cc_zero, records, true);
+        cleaningSummaries.push_back({"cc_zero", records.size(), r.size(), false, d});
+        records = reassign_row_ids(r);
     }
-    outfile << "gbifID,species,countryCode,decimalLongitude,decimalLatitude,eventDate\n";
-    for (const auto &rec : records) {
-        outfile << rec.gbifID << "," << rec.species << "," << rec.countryCode << ","
-                << rec.lon << "," << rec.lat << "," << rec.eventDate << "\n";
+    {
+        auto [r,d] = measureDuration(cc_dupl, records, true);
+        cleaningSummaries.push_back({"cc_dupl", records.size(), r.size(), false, d});
+        records = reassign_row_ids(r);
     }
-    outfile.close();
+    {
+        std::vector<std::pair<double,double>> inst = {{-77.0365,38.8977},{-0.1278,51.5074}};
+        auto [r,d] = measureDuration(cc_inst, records, inst, 1000.0, true);
+        cleaningSummaries.push_back({"cc_inst", records.size(), r.size(), false, d});
+        records = reassign_row_ids(r);
+    }
+    {
+        auto [r,d] = measureDuration(cc_coun, records, countryShp, "ISO_A3", true);
+        cleaningSummaries.push_back({"cc_coun", records.size(), r.size(), false, d});
+        records = reassign_row_ids(r);
+    }
+    {
+        auto [r,d] = measureDuration(cc_outl, records, "quantile",5.0,1000.0,7,false,0.0);
+        cleaningSummaries.push_back({"cc_outl", records.size(), r.size(), false, d});
+        records = reassign_row_ids(r);
+    }
+    {
+        std::vector<std::pair<double,double>> caps = {{-77.0369,38.9072},{2.3522,48.8566}};
+        auto [r,d] = measureDuration(cc_cap, records, caps, 10000.0, true);
+        cleaningSummaries.push_back({"cc_cap", records.size(), r.size(), false, d});
+        records = reassign_row_ids(r);
+    }
+    {
+        auto [r,d] = measureDuration(cc_gbif, records, 1000.0, true);
+        cleaningSummaries.push_back({"cc_gbif", records.size(), r.size(), false, d});
+        records = reassign_row_ids(r);
+    }
+    {
+        auto [r,d] = measureDuration(cc_sea_gdal, records, landShp, true);
+        cleaningSummaries.push_back({"cc_sea_gdal", records.size(), r.size(), false, d});
+        records = reassign_row_ids(r);
+    }
+    {
+        auto [r,d] = measureDuration(cc_sea_buffland, records, coastShp, true);
+        cleaningSummaries.push_back({"cc_sea_buffland", records.size(), r.size(), false, d});
+        records = reassign_row_ids(r);
+    }
+    {
+        auto [r,d] = measureDuration(cc_urb_gdal, records, urbShp, true);
+        cleaningSummaries.push_back({"cc_urb_gdal", records.size(), r.size(), false, d});
+        records = reassign_row_ids(r);
+    }
 
-    std::cout << "\ncleaned data written to cleaned_data1.4.csv" << std::endl;
+    auto t1 = std::chrono::steady_clock::now();
+    std::chrono::duration<double> total = t1 - t0;
+
+    std::cout<<"\n--- Cleaning Summary ---\n";
+    for (auto &s : cleaningSummaries) {
+        std::cout<<s.functionName<<": "
+                 <<s.beforeCount<<"→"<<s.afterCount
+                 <<" ("<<(s.beforeCount-s.afterCount)<<" removed)"
+                 <<" in "<<s.durationSeconds<<"s\n";
+    }
+    std::cout<<"Overall: "<<initial<<"→"<<records.size()
+             <<" in "<<total.count()<<"s\n";
+
+    std::ofstream ofs("cleaned_data1.6.csv");
+    ofs<<"gbifID,species,countryCode,decimalLongitude,decimalLatitude,eventDate\n";
+    for (auto &r : records) {
+        ofs<<r.gbifID<<","<<r.species<<","<<r.countryCode<<","
+           <<r.lon<<","<<r.lat<<","<<r.eventDate<<"\n";
+    }
+    std::cout<<"Wrote cleaned_data1.6.csv\n";
     return 0;
 }
