@@ -34,13 +34,19 @@ std::string trim(const std::string &s) {
     return s.substr(start, end - start + 1);
 }
 
+std::string upper(const std::string &s) {
+    std::string u = s;
+    std::transform(u.begin(), u.end(), u.begin(), ::toupper);
+    return u;
+}
+
 // --------------------
 // Data Structure
 // --------------------
 struct Record {
     std::string gbifID;
     std::string species;
-    std::string countryCode;
+    std::string countryCode; // always ISO3 after conversion
     double      lon;
     double      lat;
     std::string eventDate;
@@ -93,10 +99,11 @@ void freePolygons(std::vector<OGRGeometry*> &polygons) {
 // --------------------
 // Load Country Features
 // --------------------
-std::vector<std::pair<OGRGeometry*, std::string>>
-loadCountryFeatures(const std::string &shapefilePath,
-                    const std::string &isoField = "ISO_A3") {
-    std::vector<std::pair<OGRGeometry*, std::string>> feats;
+std::vector<std::pair<OGRGeometry*, std::pair<std::string,std::string>>>
+loadCountryFeaturesWithCodes(const std::string &shapefilePath,
+                             const std::string &iso2Field = "ISO_A2",
+                             const std::string &iso3Field = "ISO_A3") {
+    std::vector<std::pair<OGRGeometry*, std::pair<std::string,std::string>>> feats;
     GDALDataset *ds = (GDALDataset*)GDALOpenEx(
         shapefilePath.c_str(), GDAL_OF_VECTOR, nullptr, nullptr, nullptr
     );
@@ -111,22 +118,57 @@ loadCountryFeatures(const std::string &shapefilePath,
         OGRGeometry *geom = feat->GetGeometryRef();
         if (!geom) { OGRFeature::DestroyFeature(feat); continue; }
         OGRGeometry *clone = geom->clone();
-        const char *iso = feat->GetFieldAsString(isoField.c_str());
-        feats.emplace_back(clone, iso ? iso : "");
+        const char *a2 = feat->GetFieldAsString(iso2Field.c_str());
+        const char *a3 = feat->GetFieldAsString(iso3Field.c_str());
+        feats.emplace_back(
+            clone,
+            std::make_pair(
+                a2 ? upper(a2) : std::string{},
+                a3 ? upper(a3) : std::string{}
+            )
+        );
         OGRFeature::DestroyFeature(feat);
     }
     GDALClose(ds);
     return feats;
 }
 
-// --------------------
-// Count ISO Alpha-2 Codes
-// --------------------
-std::unordered_map<std::string,int>
-countIsoA2(const std::vector<Record> &records) {
-    std::unordered_map<std::string,int> counts;
+// Build a map from ISO2→ISO3
+std::unordered_map<std::string,std::string>
+buildIso2To3Map(const std::string &shapefilePath) {
+    auto feats = loadCountryFeaturesWithCodes(shapefilePath);
+    std::unordered_map<std::string,std::string> m;
+    for (auto &p : feats) {
+        auto &codes = p.second;
+        if (!codes.first.empty() && !codes.second.empty()) {
+            m[codes.first] = codes.second;
+        }
+        OGRGeometryFactory::destroyGeometry(p.first);
+    }
+    return m;
+}
+
+// Convert any two-letter codes in records to three-letter
+void convertIso2To3(std::vector<Record> &records,
+                    const std::unordered_map<std::string,std::string> &m) {
     for (auto &r : records) {
         if (r.countryCode.size() == 2) {
+            auto it = m.find(upper(r.countryCode));
+            if (it != m.end()) {
+                r.countryCode = it->second;
+            }
+        }
+    }
+}
+
+// --------------------
+// Count ISO3 Codes
+// --------------------
+std::unordered_map<std::string,int>
+countIso3(const std::vector<Record> &records) {
+    std::unordered_map<std::string,int> counts;
+    for (auto &r : records) {
+        if (r.countryCode.size() == 3) {
             counts[r.countryCode]++;
         }
     }
@@ -202,18 +244,19 @@ std::vector<Record> cc_zero(const std::vector<Record> &records,
     return out;
 }
 
-// cc_dupl with 10m spatial jitter and eventDate
+// cc_dupl with 10 m jitter + exact eventDate
 std::vector<Record> cc_dupl(const std::vector<Record> &records,
                             bool verbose = true) {
-    const double jitter_deg = 10.0 / 111320.0; // ~10m in degrees
+    const double jitter_deg = 10.0 / 111320.0;
     std::unordered_set<std::string> seen;
     std::vector<Record> out;
     for (auto &r : records) {
-        int cellX = static_cast<int>(std::floor(r.lon / jitter_deg));
-        int cellY = static_cast<int>(std::floor(r.lat / jitter_deg));
+        int cellX = static_cast<int>(std::floor(r.lon  / jitter_deg));
+        int cellY = static_cast<int>(std::floor(r.lat  / jitter_deg));
         std::ostringstream key;
-        key << r.species << "_" << cellX << "_" << cellY
-            << "_" << r.eventDate;
+        key << upper(r.species) << "_" 
+            << cellX << "_" << cellY << "_"
+            << trim(r.eventDate);
         std::string ks = key.str();
         if (seen.insert(ks).second) {
             out.push_back(r);
@@ -221,7 +264,7 @@ std::vector<Record> cc_dupl(const std::vector<Record> &records,
     }
     if (verbose)
         std::cout<<"cc_dupl: Removed "<<(records.size()-out.size())
-                 <<" duplicates (10m jitter + eventDate).\n";
+                 <<" records.\n";
     return out;
 }
 
@@ -243,25 +286,24 @@ std::vector<Record> cc_inst(const std::vector<Record> &records,
     }
     if (verbose)
         std::cout<<"cc_inst: Removed "<<(records.size()-out.size())
-                 <<" records (institutional).\n";
+                 <<" records.\n";
     return out;
 }
 
-// cc_coun with first ten flagged debug
+// cc_coun with debug
 std::vector<Record> cc_coun(const std::vector<Record> &records,
                             const std::string &shapefilePath,
                             const std::string &isoField = "ISO_A3",
                             bool verbose = true) {
-    auto countries = loadCountryFeatures(shapefilePath, isoField);
+    auto feats = loadCountryFeaturesWithCodes(shapefilePath, "ISO_A2", isoField);
     std::vector<Record> out;
     size_t removed = 0, debugCount = 0;
     for (auto &r : records) {
         OGRPoint pt(r.lon, r.lat);
         bool match = false;
-        for (auto &p : countries) {
-            if (pt.Within(p.first)) {
-                if (p.second == r.countryCode)
-                    match = true;
+        for (auto &p : feats) {
+            if (pt.Within(p.first) && p.second.second == upper(r.countryCode)) {
+                match = true;
                 break;
             }
         }
@@ -279,13 +321,13 @@ std::vector<Record> cc_coun(const std::vector<Record> &records,
     }
     if (verbose)
         std::cout<<"cc_coun: Removed "<<removed
-                 <<" records (country mismatch).\n";
-    for (auto &p : countries)
+                 <<" records.\n";
+    for (auto &p : feats)
         OGRGeometryFactory::destroyGeometry(p.first);
     return out;
 }
 
-// cc_outl per-species only
+// cc_outl per-species
 std::vector<Record> cc_outl(const std::vector<Record> &records,
                             const std::string &method = "quantile",
                             double mltpl = 5.0,
@@ -294,7 +336,7 @@ std::vector<Record> cc_outl(const std::vector<Record> &records,
                             bool        = false,
                             double      = 0.0) {
     std::unordered_map<std::string,std::vector<Record>> speciesMap;
-    for (auto &r : records) speciesMap[r.species].push_back(r);
+    for (auto &r : records) speciesMap[upper(r.species)].push_back(r);
     std::vector<bool> keep(records.size(), true);
     size_t idx = 0;
     for (auto &kv : speciesMap) {
@@ -487,7 +529,7 @@ std::vector<Record> loadCSV(const std::string &fn) {
         Record r;
         r.gbifID      = trim(t[ig]);
         r.species     = trim(t[is]);
-        r.countryCode = trim(t[ic]);
+        r.countryCode = upper(trim(t[ic]));
         try{ r.lat = std::stod(t[ilat]); } catch(...){ r.lat = NAN; }
         try{ r.lon = std::stod(t[ilon]); } catch(...){ r.lon = NAN; }
         r.eventDate = trim(t[ie]);
@@ -525,10 +567,14 @@ int main() {
     auto records = loadCSV(csvFile);
     size_t initial = records.size();
 
-    // Count ISO Alpha-2 codes before cleaning
-    auto isoA2Counts = countIsoA2(records);
-    std::cout<<"ISO Alpha-2 countryCode counts:\n";
-    for (auto &kv : isoA2Counts) {
+    // Convert any ISO2 to ISO3
+    auto iso2to3 = buildIso2To3Map(countryShp);
+    convertIso2To3(records, iso2to3);
+
+    // Count ISO3 codes before cleaning
+    auto iso3Counts = countIso3(records);
+    std::cout<<"ISO Alpha-3 countryCode counts:\n";
+    for (auto &kv : iso3Counts) {
         std::cout<<"  "<<kv.first<<": "<<kv.second<<"\n";
     }
 
