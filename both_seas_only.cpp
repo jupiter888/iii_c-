@@ -1,7 +1,7 @@
+// >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>______SEAS ONLY__(Improved)____<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
 #include <arrow/api.h>
 #include <arrow/io/api.h>
 #include <parquet/arrow/reader.h>
-// >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>______SEAS ONLY______<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
 #include <chrono>
 #include <cmath>
 #include <fstream>
@@ -129,30 +129,56 @@ std::vector<Record> cc_sea_gdal(const std::vector<Record> &records,
 std::vector<Record> cc_sea_buffland(const std::vector<Record> &records,
                                     const std::string &shp,
                                     bool verbose = true) {
-    if (verbose) std::cout << "cc_sea_buffland: buffered test\n";
+    if (verbose) std::cout << "cc_sea_buffland: optimized buffered test\n";
     auto coast = loadPolygons(shp);
     if (coast.empty()) {
         std::cerr << "no coast loaded\n";
         return records;
     }
-    std::vector<OGRGeometry*> buf;
-    for (auto *g : coast) buf.push_back(g->Buffer(1.0));
-    for (auto *g : coast) OGRGeometryFactory::destroyGeometry(g);
-    std::vector<Record> out;
-    for (auto &r : records) {
-        OGRPoint pt(r.lon, r.lat);
-        bool onLand = false;
-        for (auto *g : buf) {
-            if (pt.Within(g)) {
-                onLand = true;
-                break;
-            }
+
+    OGRGeometry* mergedBuffer = nullptr;
+    const double simplifyTolerance = 0.01;
+    const double bufferDistance = 0.1;
+
+    for (auto *g : coast) {
+        OGRGeometry* simplified = g->Simplify(simplifyTolerance);
+        OGRGeometry* buffered = simplified->Buffer(bufferDistance);
+        if (!mergedBuffer) {
+            mergedBuffer = buffered;
+        } else {
+            OGRGeometry* temp = mergedBuffer->Union(buffered);
+            OGRGeometryFactory::destroyGeometry(mergedBuffer);
+            OGRGeometryFactory::destroyGeometry(buffered);
+            mergedBuffer = temp;
         }
-        if (onLand) out.push_back(r);
+        OGRGeometryFactory::destroyGeometry(simplified);
+        OGRGeometryFactory::destroyGeometry(g);
     }
+
+    if (!mergedBuffer) {
+        std::cerr << "Buffer union failed\n";
+        return records;
+    }
+
+    std::vector<Record> out;
+    OGREnvelope env;
+    mergedBuffer->getEnvelope(&env);
+
+    for (auto &r : records) {
+        if (r.lon < env.MinX || r.lon > env.MaxX ||
+            r.lat < env.MinY || r.lat > env.MaxY) {
+            continue;
+        }
+        OGRPoint pt(r.lon, r.lat);
+        if (pt.Intersects(mergedBuffer)) {
+            out.push_back(r);
+        }
+    }
+
+    OGRGeometryFactory::destroyGeometry(mergedBuffer);
     if (verbose)
         std::cout << "cc_sea_buffland: Removed " << (records.size() - out.size()) << " records.\n";
-    for (auto *g : buf) OGRGeometryFactory::destroyGeometry(g);
+
     return out;
 }
 
