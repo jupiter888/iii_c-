@@ -1,4 +1,4 @@
-// >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>______SEAS ONLY__(Improved)____<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+// >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>______SEAS ONLY__(Improved3)____<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
 #include <arrow/api.h>
 #include <arrow/io/api.h>
 #include <parquet/arrow/reader.h>
@@ -163,18 +163,20 @@ std::vector<Record> cc_sea_buffland(const std::vector<Record> &records,
     std::vector<Record> out;
     OGREnvelope env;
     mergedBuffer->getEnvelope(&env);
+    OGRPreparedGeometry* prep = OGRCreatePreparedGeometry(mergedBuffer);
 
-    for (auto &r : records) {
+    for (const auto &r : records) {
         if (r.lon < env.MinX || r.lon > env.MaxX ||
             r.lat < env.MinY || r.lat > env.MaxY) {
             continue;
         }
         OGRPoint pt(r.lon, r.lat);
-        if (pt.Intersects(mergedBuffer)) {
+        if (OGRPreparedGeometryIntersects(prep, &pt)) {
             out.push_back(r);
         }
     }
 
+    OGRDestroyPreparedGeometry(prep);
     OGRGeometryFactory::destroyGeometry(mergedBuffer);
     if (verbose)
         std::cout << "cc_sea_buffland: Removed " << (records.size() - out.size()) << " records.\n";
@@ -281,12 +283,12 @@ int main() {
     std::cout << "Overall: " << initial << "→" << records.size()
               << " in " << total.count() << "s\n";
 
-    std::ofstream ofs("1.2_10k_seas_cleaned.csv");
+    std::ofstream ofs("1.3_10k_seas_cleaned.csv");
     ofs << "gbifID,species,countryCode,decimalLongitude,decimalLatitude,eventDate\n";
     for (auto &r : records) {
         ofs << r.gbifID << "," << r.species << "," << r.countryCode << ","
             << r.lon << "," << r.lat << "," << r.eventDate << "\n";
     }
-    std::cout << "Wrote 1.2_seas_cleaned.csv\n";
+    std::cout << "Wrote 1.3_seas_cleaned.csv\n";
     return 0;
 }
