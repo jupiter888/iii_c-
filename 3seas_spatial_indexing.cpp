@@ -1,3 +1,5 @@
+// >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>______SEAS ONLY__(Improved4 with Rtrees from GEOS(!GDAL) )____<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+// Compile: g++ -std=c++17 main.cpp -o data_cleaner $(gdal-config --cflags) $(gdal-config --libs)
 #include <arrow/api.h>
 #include <arrow/io/api.h>
 #include <parquet/arrow/reader.h>
@@ -16,11 +18,18 @@
 #include <csignal>
 #include <cstdlib>
 
+#include <boost/geometry.hpp>
+#include <boost/geometry/index/rtree.hpp>
 #include "gdal_priv.h"
 #include "ogrsf_frmts.h"
-#include "gdal_alg.h" // For RTree API
 
 namespace fs = std::filesystem;
+namespace bg = boost::geometry;
+namespace bgi = boost::geometry::index;
+
+typedef bg::model::point<double, 2, bg::cs::cartesian> BoostPoint;
+typedef bg::model::box<BoostPoint> BoostBox;
+typedef std::pair<BoostBox, size_t> RTreeValue;
 
 std::string trim(const std::string &s) {
     size_t start = s.find_first_not_of(" \t\n\r\"");
@@ -129,72 +138,46 @@ std::vector<Record> cc_sea_gdal(const std::vector<Record> &records,
 std::vector<Record> cc_sea_rtree(const std::vector<Record> &records,
                                  const std::string &shp,
                                  bool verbose = true) {
-    if (verbose) std::cout << "cc_sea_rtree: high-performance coastline water removal\n";
-
-    auto coast = loadPolygons(shp);
-    if (coast.empty()) {
-        std::cerr << "no coast loaded\n";
+    if (verbose) std::cout << "cc_sea_rtree: fast land test using Boost R-tree\n";
+    auto land = loadPolygons(shp);
+    if (land.empty()) {
+        std::cerr << "no land polygons loaded\n";
         return records;
     }
 
-    const double simplifyTolerance = 0.01;   // Reduce geometry detail
-    const double bufferDistance = 0.1;       // ~11 km buffer
-
-    std::vector<OGRGeometry*> bufferedGeoms;
+    bgi::rtree<RTreeValue, bgi::quadratic<16>> rtree;
     std::vector<OGRPreparedGeometry*> preparedGeoms;
 
-    void* hRTree = CPLRTreeCreate(8);
-
-    for (size_t i = 0; i < coast.size(); ++i) {
-        OGRGeometry* simplified = coast[i]->Simplify(simplifyTolerance);
-        OGRGeometry* buffered = simplified->Buffer(bufferDistance);
-
-        if (buffered) {
-            OGREnvelope env;
-            buffered->getEnvelope(&env);
-
-            double minmax[4] = { env.MinX, env.MinY, env.MaxX, env.MaxY };
-            CPLRTreeInsert(hRTree, minmax, (int)i);
-
-            bufferedGeoms.push_back(buffered);
-            preparedGeoms.push_back(OGRCreatePreparedGeometry(buffered));
-        }
-
-        OGRGeometryFactory::destroyGeometry(simplified);
-        OGRGeometryFactory::destroyGeometry(coast[i]);
+    for (size_t i = 0; i < land.size(); ++i) {
+        OGREnvelope env;
+        land[i]->getEnvelope(&env);
+        BoostBox bbox(BoostPoint(env.MinX, env.MinY), BoostPoint(env.MaxX, env.MaxY));
+        rtree.insert(std::make_pair(bbox, i));
+        preparedGeoms.push_back(OGRCreatePreparedGeometry(land[i]));
     }
-    coast.clear();
 
     std::vector<Record> out;
-    out.reserve(records.size());
-
-    int hits[256];
-
     for (const auto &r : records) {
-        double ptEnv[4] = { r.lon, r.lat, r.lon, r.lat };
-        int numHits = CPLRTreeSearch(hRTree, ptEnv, hits, 256);
+        BoostPoint pt(r.lon, r.lat);
+        std::vector<RTreeValue> results;
+        rtree.query(bgi::intersects(pt), std::back_inserter(results));
 
         bool keep = false;
-        if (numHits > 0) {
-            OGRPoint pt(r.lon, r.lat);
-            for (int j = 0; j < numHits; ++j) {
-                if (OGRPreparedGeometryIntersects(preparedGeoms[hits[j]], &pt)) {
-                    keep = true;
-                    break;
-                }
+        OGRPoint ogrPt(r.lon, r.lat);
+        for (const auto &val : results) {
+            if (OGRPreparedGeometryIntersects(preparedGeoms[val.second], &ogrPt)) {
+                keep = true;
+                break;
             }
         }
-
         if (keep) out.push_back(r);
     }
 
-    CPLRTreeDestroy(hRTree);
-    for (auto *g : bufferedGeoms) OGRGeometryFactory::destroyGeometry(g);
-    for (auto *pg : preparedGeoms) OGRDestroyPreparedGeometry(pg);
+    for (auto *g : preparedGeoms) OGRDestroyPreparedGeometry(g);
+    for (auto *g : land) OGRGeometryFactory::destroyGeometry(g);
 
     if (verbose)
         std::cout << "cc_sea_rtree: Removed " << (records.size() - out.size()) << " records.\n";
-
     return out;
 }
 
@@ -268,7 +251,6 @@ int main() {
 
     std::string csvFile    = "/Users/njord888/downloads/10k_germany.csv";
     std::string landShp    = "/Users/njord888/Downloads/ne_10m_land/ne_10m_land.shp";
-    std::string coastShp   = "/Users/njord888/Downloads/ne_10m_coastline/ne_10m_coastline.shp";
 
     auto records = loadCSV(csvFile);
     size_t initial = records.size();
@@ -279,7 +261,7 @@ int main() {
         records = reassign_row_ids(r);
     }
     {
-        auto [r, d] = measureDuration(cc_sea_rtree, records, coastShp, true);
+        auto [r, d] = measureDuration(cc_sea_rtree, records, landShp, true);
         cleaningSummaries.push_back({"cc_sea_rtree", records.size(), r.size(), false, d});
         records = reassign_row_ids(r);
     }
