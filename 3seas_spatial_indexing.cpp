@@ -1,7 +1,5 @@
 // >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>______SEAS ONLY__(Improved4 with Rtrees from GEOS(!GDAL) )____<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
 // Compile: g++ -std=c++17 main.cpp -o data_cleaner $(gdal-config --cflags) $(gdal-config --libs)
-// Usage: g++ -std=c++17 main.cpp -o data_cleaner $(gdal-config --cflags) $(gdal-config --libs)
-// >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>______SEAS ONLY WITH R-TREE FIXED____<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
 #include <arrow/api.h>
 #include <arrow/io/api.h>
 #include <parquet/arrow/reader.h>
