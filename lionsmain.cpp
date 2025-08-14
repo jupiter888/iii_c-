@@ -288,6 +288,44 @@ std::vector<Record> cc_dupl(const std::vector<Record> &records,
     return out;
 }
 
+// cc_equ — equal lat/lon removal (absolute or identical)
+std::vector<Record> cc_equ(const std::vector<Record> &records,
+                           const std::string &test = "absolute",
+                           bool verbose = true) {
+    bool absolute;
+    if (test == "absolute") {
+        absolute = true;
+    } else if (test == "identical") {
+        absolute = false;
+    } else {
+        std::cerr << "cc_equ: unknown test \"" << test
+                  << "\" (use \"absolute\" or \"identical\"). Using \"absolute\".\n";
+        absolute = true;
+    }
+
+    std::vector<Record> out;
+    out.reserve(records.size());
+    size_t removed = 0;
+
+    for (const auto &r : records) {
+        if (std::isnan(r.lon) || std::isnan(r.lat)) {
+            out.push_back(r); // leave NaNs to cc_val
+            continue;
+        }
+        bool equal = absolute
+            ? (std::fabs(r.lon) == std::fabs(r.lat))
+            : (r.lon == r.lat);
+        if (equal) ++removed;
+        else out.push_back(r);
+    }
+
+    if (verbose) {
+        std::cout << "cc_equ (" << (absolute ? "absolute" : "identical")
+                  << "): Removed " << removed << " records.\n";
+    }
+    return out;
+}
+
 // cc_inst (parallel)
 std::vector<Record> cc_inst(const std::vector<Record> &records,
                             const std::vector<std::pair<double,double>> &inst,
@@ -392,7 +430,6 @@ std::vector<Record> cc_outl(const std::vector<Record> &records,
         const auto &key = speciesKeys[si];
         const auto &idxs = groups[key];
         if (idxs.size() < (size_t)min_occs) {
-            // skip small groups
             continue;
         }
         size_t n = idxs.size();
@@ -584,7 +621,6 @@ static std::vector<Record> filterRecordsByMask(
     const int xSize = rm.xSize, ySize = rm.ySize;
     const double west = rm.west, north = rm.north, res = rm.res;
 
-    // Parallel chunking with thread-local buffers and a critical merge
     #pragma omp parallel
     {
         std::vector<Record> local;
@@ -617,7 +653,6 @@ std::vector<Record> cc_sea_gdal(const std::vector<Record> &records,
                                 bool verbose = true)
 {
     if (verbose) std::cout<<"cc_sea_gdal (raster mask): land test\n";
-    // Load all land polygons
     std::vector<OGRGeometry*> landGeoms;
     {
         GDALDataset *ds = (GDALDataset*)GDALOpenEx(landShp.c_str(), GDAL_OF_VECTOR, nullptr, nullptr, nullptr);
@@ -795,6 +830,11 @@ int main() {
     {
         auto [r,d] = measureDuration(cc_dupl, records, true);
         cleaningSummaries.push_back({"cc_dupl", records.size(), r.size(), false, d});
+        records = reassign_row_ids(r);
+    }
+    {
+        auto [r,d] = measureDuration(cc_equ, records, "absolute", true);
+        cleaningSummaries.push_back({"cc_equ", records.size(), r.size(), false, d});
         records = reassign_row_ids(r);
     }
     { // cc_inst (parallel)
