@@ -1,7 +1,3 @@
-#include <arrow/api.h>
-#include <arrow/io/api.h>
-#include <parquet/arrow/reader.h>
-
 #include <chrono>
 #include <cmath>
 #include <fstream>
