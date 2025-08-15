@@ -1,3 +1,5 @@
+# COMPILE
+# g++-14 -std=c++17 -O3 -march=native -fopenmp \ main.cpp \ $(gdal-config --cflags) $(gdal-config --libs) \ -Wl,-rpath,"$(gdal-config --prefix)/lib" \ -o data_cleaner
 #include <chrono>
 #include <cmath>
 #include <fstream>
