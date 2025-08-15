@@ -1,5 +1,10 @@
+// brew install gdal gcc@14
 // COMPILE
 // g++-14 -std=c++17 -O3 -march=native -fopenmp \ main.cpp \ $(gdal-config --cflags) $(gdal-config --libs) \ -Wl,-rpath,"$(gdal-config --prefix)/lib" \ -o data_cleaner
+// export OMP_NUM_THREADS=$(sysctl -n hw.physicalcpu)
+// export OMP_PROC_BIND=close
+// export OMP_PLACES=cores
+// caffeinate -i ./data_cleaner
 #include <chrono>
 #include <cmath>
 #include <fstream>
