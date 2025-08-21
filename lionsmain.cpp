@@ -732,6 +732,37 @@ std::vector<Record> cc_sea_buffland(const std::vector<Record> &records,
     return out;
 }
 
+
+
+// cc_urb_gdal
+std::vector<Record> cc_urb_gdal(const std::vector<Record> &records,
+                                const std::string &shp,
+                                bool verbose) {
+    if (verbose) std::cout<<"cc_urb_gdal: urban test\n";
+    auto urb = loadPolygons(shp);
+    if (urb.empty()) { std::cerr<<"no urban loaded\n"; return records; }
+
+    std::vector<Record> out;
+    out.reserve(records.size());
+
+    for (const auto &r : records) {
+        OGRPoint pt(r.lon, r.lat);
+        bool inU = false;
+        for (auto *g : urb) {
+            if (pt.Within(g)) { inU = true; break; }
+        }
+        if (!inU) out.push_back(r);
+    }
+
+    if (verbose)
+        std::cout<<"cc_urb_gdal: Removed "<<(records.size()-out.size())
+                 <<" records.\n";
+
+    for (auto *g : urb) OGRGeometryFactory::destroyGeometry(g);
+    return out;
+}
+
+
 // --------------------
 // CSV Loading
 // --------------------
@@ -822,64 +853,64 @@ int main() {
 
     {
         auto [r,d] = measureDuration(cc_val, records, true);
-        cleaningSummaries.push_back({"cc_val", initial, r.size(), false, d});
+        cleaningSummaries.push_back(CleaningSummary{"cc_val", initial, r.size(), false, d});
         records = reassign_row_ids(r);
     }
     {
         auto [r,d] = measureDuration(cc_zero, records, true);
-        cleaningSummaries.push_back({"cc_zero", records.size(), r.size(), false, d});
+        cleaningSummaries.push_back(CleaningSummary{"cc_zero", records.size(), r.size(), false, d});
         records = reassign_row_ids(r);
     }
     {
         auto [r,d] = measureDuration(cc_dupl, records, true);
-        cleaningSummaries.push_back({"cc_dupl", records.size(), r.size(), false, d});
+        cleaningSummaries.push_back(CleaningSummary{"cc_dupl", records.size(), r.size(), false, d});
         records = reassign_row_ids(r);
     }
     {
         auto [r,d] = measureDuration(cc_equ, records, "absolute", true);
-        cleaningSummaries.push_back({"cc_equ", records.size(), r.size(), false, d});
+        cleaningSummaries.push_back(CleaningSummary{"cc_equ", records.size(), r.size(), false, d});
         records = reassign_row_ids(r);
     }
     { // cc_inst (parallel)
         std::vector<std::pair<double,double>> inst = {{-77.0365,38.8977},{-0.1278,51.5074}};
         auto [r,d] = measureDuration(cc_inst, records, inst, 1000.0, true);
-        cleaningSummaries.push_back({"cc_inst", records.size(), r.size(), false, d});
+        cleaningSummaries.push_back(CleaningSummary{"cc_inst", records.size(), r.size(), false, d});
         records = reassign_row_ids(r);
     }
     {
         auto [r,d] = measureDuration(cc_coun, records, countryShp, "ISO_A3", true);
-        cleaningSummaries.push_back({"cc_coun", records.size(), r.size(), false, d});
+        cleaningSummaries.push_back(CleaningSummary{"cc_coun", records.size(), r.size(), false, d});
         records = reassign_row_ids(r);
     }
     { // cc_outl (parallel across species)
         auto [r,d] = measureDuration(cc_outl, records, "quantile",5.0,1000.0,7,false,0.0);
-        cleaningSummaries.push_back({"cc_outl", records.size(), r.size(), false, d});
+        cleaningSummaries.push_back(CleaningSummary{"cc_outl", records.size(), r.size(), false, d});
         records = reassign_row_ids(r);
     }
     {
         std::vector<std::pair<double,double>> caps = {{-77.0369,38.9072},{2.3522,48.8566}};
         auto [r,d] = measureDuration(cc_cap, records, caps, 10000.0, true);
-        cleaningSummaries.push_back({"cc_cap", records.size(), r.size(), false, d});
+        cleaningSummaries.push_back(CleaningSummary{"cc_cap", records.size(), r.size(), false, d});
         records = reassign_row_ids(r);
     }
     {
         auto [r,d] = measureDuration(cc_gbif, records, 1000.0, true);
-        cleaningSummaries.push_back({"cc_gbif", records.size(), r.size(), false, d});
+        cleaningSummaries.push_back(CleaningSummary{"cc_gbif", records.size(), r.size(), false, d});
         records = reassign_row_ids(r);
     }
     {
         auto [r,d] = measureDuration(cc_sea_gdal, records, landShp, true);
-        cleaningSummaries.push_back({"cc_sea_gdal", records.size(), r.size(), false, d});
+        cleaningSummaries.push_back(CleaningSummary{"cc_sea_gdal", records.size(), r.size(), false, d});
         records = reassign_row_ids(r);
     }
     {
-        auto [r,d] = measureDuration(cc_sea_buffland, records, coastShp, true);
-        cleaningSummaries.push_back({"cc_sea_buffland", records.size(), r.size(), false, d});
+        auto [r,d] = measureDuration(cc_sea_buffland, records, coastShp, true, 1.0);
+        cleaningSummaries.push_back(CleaningSummary{"cc_sea_buffland", records.size(), r.size(), false, d});
         records = reassign_row_ids(r);
     }
     {
         auto [r,d] = measureDuration(cc_urb_gdal, records, urbShp, true);
-        cleaningSummaries.push_back({"cc_urb_gdal", records.size(), r.size(), false, d});
+        cleaningSummaries.push_back(CleaningSummary{"cc_urb_gdal", records.size(), r.size(), false, d});
         records = reassign_row_ids(r);
     }
 
